@@ -1,0 +1,50 @@
+{
+  "source": "智联招聘",
+  "entry_url": "https://www.zhaopin.com/jobs/?pageMode=recommend",
+  "inspected_at": "2026-11-21",
+  "classes": {
+    "list": "job-list-panel",
+    "card": "job-card",
+    "card_title": "vue-clamp__text",
+    "card_salary": "job-card__salary",
+    "card_company": "job-card__company-name",
+    "card_location": "job-card__location",
+    "panel_root": "job-detail-modules",
+    "panel_title": "job-detail-summary__title-text",
+    "panel_salary": "job-detail-summary__salary",
+    "panel_tag": "job-detail-summary__tag",
+    "panel_section_title": "job-detail-card__title",
+    "panel_section_body": "job-detail-card__body",
+    "detail_link": "job-detail-view-more",
+    "detail_title": "summary-planes__title",
+    "detail_salary": "summary-planes__salary",
+    "detail_meta": "summary-planes__info",
+    "detail_client_company": "summary-planes__info-company",
+    "detail_company": "company-summary__name",
+    "company_summary_item": "company-summary__item",
+    "company_summary_scale": "company-summary__icon--scale",
+    "join_company_item": "join-company-info__item",
+    "join_company_label": "join-company-info__label",
+    "join_company_value": "join-company-info__value",
+    "detail_skill": "describtion-card__skills-item",
+    "detail_description": "describtion-card__detail-content"
+  },
+  "pagination": {
+    "mode": "document_scroll",
+    "next_button_observed": false,
+    "notes": "推荐页职位列表在 document.scrollingElement 滚到底部后继续加载。本次观察数量从 20 增至 60，再增至 80。未发现“下一页”或“加载更多”按钮。"
+  },
+  "login_phrases": ["扫码登录", "密码登录", "验证码登录", "请登录", "登录/注册", "登录后可查看专属职位推荐", "去登录"],
+  "block_phrases": ["安全验证", "滑动验证", "访问验证", "操作过于频繁"],
+  "apply_button_text": "立即投递",
+  "inspection": {
+    "recommend_page_observed": true,
+    "detail_page_observed": true,
+    "detail_page_example_path": "/jobdetail/CCL1480117890J40910946705.htm",
+    "login_wall_observed": true,
+    "logged_out_marker": "home-header__c-no-login",
+    "logged_out_text": "登录后可查看专属职位推荐",
+    "captcha_observed": false,
+    "notes": "已登录推荐页能看到 div.job-card，详情页类名沿用站点原有拼写 describtion。未登录时同一地址不渲染职位，页头类名 home-header__c-no-login，正文出现“登录/注册”和“登录后可查看专属职位推荐”。本次未出现验证码。雇主名称取职位卡片和 company-summary__name；summary-planes__info-company 是客户公司，不能当作雇主。侧栏标签和详情页信息顺序均为地点、经验、学历。立即投递按钮存在，本程序不点击它。"
+  }
+}

@@ -1,0 +1,27 @@
+# 登录态、缓存和浏览器指纹。里面有智联 Cookie，不能上传。
+browser_data/
+
+# 运行日志可能含职位和筛选说明。
+logs/
+
+# 本地数据库含简历正文、投递记录和职位。整个目录都不上传。
+data/
+
+# 个人筛选条件、学校和项目。用 profile.example.json 作为模板。
+config/profile.json
+config/secrets.json
+.env
+.env.*
+
+# 简历原件。
+*.pdf
+
+# 本地环境和编辑器。
+.idea/
+.vscode/
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.zip

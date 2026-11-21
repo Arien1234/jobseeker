@@ -1,0 +1,34 @@
+{
+  "target_url": "https://www.zhaopin.com/jobs/?pageMode=recommend",
+  "auto_apply": true,
+  "min_apply_score": 80,
+  "salary_floor_k": 7,
+  "salary_min_k": 10,
+  "salary_max_k": null,
+  "min_company_size": 100,
+  "salary_type": "税前",
+  "cities": ["深圳"],
+  "target_roles": [
+    "Python 开发工程师",
+    "AI 应用工程师"
+  ],
+  "blocked_titles": ["销售专员", "客服"],
+  "blocked_keywords": ["无底薪", "小时工"],
+  "preferred_keywords": ["Python", "FastAPI", "AI"],
+  "education": {
+    "school": "",
+    "major": "",
+    "degree": "本科",
+    "graduation_year": null,
+    "status": ""
+  },
+  "skills": ["Python", "FastAPI"],
+  "projects": [],
+  "project_policy": "项目经历只能来自用户上传的简历原文。简历为空时，禁止编写任何项目。",
+  "hard_rules": {
+    "reject_cities_outside": true,
+    "reject_degrees": ["硕士", "博士", "研究生", "MBA", "EMBA"],
+    "reject_experience_at_least_years": 3,
+    "reject_salary_max_below_min": true
+  }
+}

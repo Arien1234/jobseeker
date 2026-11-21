@@ -1,0 +1,886 @@
+"""Single worker for the visible browser, collection, and AI queue."""
+
+from __future__ import annotations
+
+import queue
+import threading
+import time
+from collections import deque
+from pathlib import Path
+
+from core.application import cancel_application, confirm_application, enqueue_recommended
+from core.browser import BrowserSession, ManualActionRequired, browser_was_closed
+from core.collector import CollectionStopped, collect_jobs
+from core.database import Database
+from core.importer import import_csv
+from core.logging_config import get_logger
+from core.profile_store import load_profile, save_profile
+from core.resume_parser import extract_resume_text, redact_personal_info
+
+logger = get_logger("app")
+
+
+def _split_terms(text: str) -> list[str]:
+    found: list[str] = []
+    normalized = str(text or "").replace("，", ",").replace("、", ",").replace("\n", ",")
+    for part in normalized.split(","):
+        item = part.strip()
+        if item and item not in found:
+            found.append(item)
+    return found
+
+
+def _split_lines(text: str) -> list[str]:
+    return [line.strip() for line in str(text or "").splitlines() if line.strip()]
+
+
+class CollectController:
+    def __init__(self, database: Database | None = None):
+        self.db = database or Database()
+        self._queue: queue.Queue = queue.Queue()
+        self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+        self.pause_event = threading.Event()
+        self.stop_event = threading.Event()
+        self._watch = False
+        self._page_mark = ""
+        self._sent_urls: set[str] = set()
+        self._busy = False
+        self._active_task = "采集中"
+        self.logs: deque[str] = deque(maxlen=200)
+        self.snapshot = {
+            "browser": "未启动",
+            "login": "未检测",
+            "task": "空闲",
+            "progress": "0/0",
+            "collected": 0,
+            "duplicated": 0,
+            "failed": 0,
+            "screened": 0,
+            "applied": 0,
+        }
+
+    def _set(self, **values) -> None:
+        with self._lock:
+            self.snapshot.update(values)
+
+    def _set_busy(self, busy: bool) -> None:
+        with self._lock:
+            self._busy = busy
+
+    def _log(self, message: str) -> None:
+        text = str(message)
+        with self._lock:
+            self.logs.append(text)
+        logger.info(text)
+
+    def _ensure_thread(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(target=self._loop, name="jobhunter-worker", daemon=True)
+        self._thread.start()
+
+    def _loop(self) -> None:
+        browser = BrowserSession(headless=False)
+        while True:
+            try:
+                command = self._queue.get(timeout=2)
+            except queue.Empty:
+                self._watch_page(browser)
+                continue
+            name = command[0]
+            try:
+                if name == "shutdown":
+                    browser.close()
+                    break
+                if name == "start_browser":
+                    self._start_browser(browser)
+                elif name == "refresh_login":
+                    self._refresh_login(browser)
+                elif name == "collect":
+                    self._collect(browser, int(command[1]), batch=False)
+                elif name == "batch":
+                    self._collect(browser, int(command[1]), batch=True)
+                elif name == "refresh_batch":
+                    self._collect(browser, int(command[1]), batch=True, refresh=True)
+                elif name == "apply":
+                    self._screen_and_apply(browser, int(command[1]))
+                elif name == "clear_recollect":
+                    self._clear_and_recollect(browser)
+                elif name == "analyze":
+                    self._analyze()
+                elif name == "close_browser":
+                    self._watch = False
+                    browser.close()
+                    self._set(browser="未启动", login="未检测", task="空闲")
+                    self._log("浏览器已关闭")
+            except Exception as exc:
+                if browser_was_closed(exc) or not browser.is_alive():
+                    browser.close()
+                    self._watch = False
+                    self._set(browser="未启动", login="未检测", task="空闲")
+                    self._log("浏览器窗口已关闭，可以重新启动")
+                else:
+                    self._log(f"任务失败: {exc}")
+                    self._set(task="失败")
+            finally:
+                if name != "shutdown":
+                    self._set_busy(False)
+
+    def _on_browser_disconnected(self) -> None:
+        with self._lock:
+            task = self.snapshot["task"]
+            self.snapshot["browser"] = "未启动"
+            self.snapshot["login"] = "未检测"
+            idle = task not in {"采集中", "已暂停", "筛选投递中", "分析中", "启动浏览器"}
+            if idle:
+                self.snapshot["task"] = "空闲"
+        if idle:
+            self._log("浏览器窗口已关闭，可以重新启动")
+
+    def _start_browser(self, browser: BrowserSession) -> None:
+        self._set(task="启动浏览器")
+        try:
+            if browser.is_alive():
+                status = browser.classify()
+                self._set(browser="已启动", login=status, task="空闲")
+                self._log("浏览器已在运行")
+                self._watch = True
+                if status == "已登录":
+                    self._auto_collect(browser, replace=True)
+                return
+            browser.start(on_closed=self._on_browser_disconnected)
+            status = browser.open_entry(self._entry_url())
+        except Exception as exc:
+            logger.error("浏览器启动失败")
+            browser.close()
+            if browser_was_closed(exc):
+                self._set(browser="未启动", login="未检测", task="空闲")
+                self._log("浏览器窗口已关闭，可以重新启动")
+                return
+            self._set(browser="启动失败", login="未检测", task="空闲")
+            self._log(f"浏览器启动失败: {exc}")
+            return
+        self._set(browser="已启动", login=status, task="空闲")
+        self._log(f"浏览器已启动，登录状态：{status}")
+        self._watch = True
+        self._page_mark = ""
+        if status == "已登录":
+            self._log("职位页已打开，开始自动采集")
+            self._auto_collect(browser, replace=True)
+            return
+        self._log("请在打开的浏览器里手动登录。登录完成后会自动采集当前职位。")
+
+    def _refresh_login(self, browser: BrowserSession) -> None:
+        if not browser.is_alive():
+            browser.close()
+            self._set(browser="未启动", login="未检测", task="空闲")
+            self._log("浏览器窗口已关闭，可以重新启动")
+            return
+        try:
+            status = browser.classify()
+            if status != "已登录":
+                status = browser.open_entry(self._entry_url())
+        except Exception as exc:
+            if browser_was_closed(exc) or not browser.is_alive():
+                browser.close()
+                self._set(browser="未启动", login="未检测", task="空闲")
+                self._log("浏览器窗口已关闭，可以重新启动")
+                return
+            logger.warning("登录状态异常: %s", type(exc).__name__)
+            self._log(f"登录状态异常: {exc}")
+            self._set(task="空闲")
+            return
+        self._set(browser="已启动", login=status, task="空闲")
+        self._log(f"登录状态：{status}")
+
+    def _entry_url(self) -> str:
+        profile = load_profile()
+        return (profile.get("target_url") or "").strip() or "https://www.zhaopin.com/jobs/?pageMode=recommend"
+
+    def _bump(self, key: str) -> None:
+        with self._lock:
+            self.snapshot[key] = int(self.snapshot.get(key) or 0) + 1
+
+    def _on_job(self, profile: dict, force_rescreen: bool = False):
+        from core.ai_filter import AIError, analyze_job, local_rejection
+        from core.application import should_auto_apply
+        from core.auto_apply import apply_current_job
+        from core.rules import evaluate_rules
+
+        resume_text = self.db.resume_text()
+
+        def handle(page, job: dict) -> None:
+            job_id = self.db.find_job_id(job)
+            if job_id is None:
+                logger.error("数据库保存失败")
+                self._log(f"数据库保存失败: {job.get('title')}")
+                return
+            stored = self.db.get_job(job_id) or job
+            decision = evaluate_rules(stored, profile)
+            needs_model = force_rescreen or stored.get("ai_score") is None or (
+                bool(stored.get("ai_hard_reject")) and not decision.hard_reject
+            )
+            if decision.hard_reject:
+                result = local_rejection(stored, profile)
+                self.db.save_analysis(job_id, result)
+            elif needs_model:
+                try:
+                    result = analyze_job(stored, profile, resume_text)
+                    self.db.save_analysis(job_id, result)
+                except AIError:
+                    self.db.record_application(job_id, "failed", "Ollama 调用失败")
+                    self._log(f"筛选失败 {job.get('title')}")
+                    return
+            else:
+                result = {
+                    "score": int(stored["ai_score"]),
+                    "recommendation": stored.get("ai_recommendation") or "",
+                    "hard_reject": bool(stored.get("ai_hard_reject")),
+                    "unknown_fields": [],
+                }
+            self._bump("screened")
+            self._log(f"筛选 {job.get('title')}：{result['score']} {result['recommendation']}")
+            ok, reason = should_auto_apply(result, profile)
+            if not ok:
+                self.db.record_application(job_id, "skipped", reason)
+                self._log(f"不投递 {job.get('title')}：{reason}")
+                return
+            outcome, detail = apply_current_job(page)
+            if outcome in {"submitted", "already"}:
+                self.db.record_application(job_id, "submitted", detail)
+                if outcome == "submitted":
+                    self._bump("applied")
+                self._log(f"{'已投递' if outcome == 'submitted' else '已经投过'} {job.get('title')}：{detail}")
+                return
+            logger.error("投递任务失败")
+            self.db.record_application(job_id, "failed", detail)
+            self._log(f"投递失败 {job.get('title')}：{detail}")
+
+        return handle
+
+    def _capture_sent(self) -> None:
+        try:
+            self._sent_urls.update(self.db.submitted_urls())
+        except Exception:
+            logger.error("读取数据库失败")
+
+    def _mark_already_sent(self) -> None:
+        if not self._sent_urls:
+            return
+        for job in self.db.jobs_in_collect_order():
+            url = job.get("url") or ""
+            if url in self._sent_urls and job.get("application_status") != "submitted":
+                self.db.record_application(int(job["id"]), "submitted", "本轮已经投递过")
+
+    def _remember_page(self, browser: BrowserSession) -> None:
+        if not browser.is_alive():
+            return
+        try:
+            from core.collector import list_mark
+
+            self._page_mark = list_mark(browser.page) or self._page_mark
+        except Exception:
+            return
+
+    def _auto_collect(self, browser: BrowserSession, replace: bool) -> None:
+        from core.collector import collect_jobs
+
+        self._set_busy(True)
+        self._set(task="采集中", progress="采集中")
+        try:
+            if replace:
+                self._capture_sent()
+                self.db.clear_job_list()
+                self._log("页面职位已更换，原先采集的已全部删除")
+            status = browser.ensure_collection_allowed(self._entry_url())
+            if status != "已登录":
+                raise ManualActionRequired(status)
+            self._set(login=status)
+
+            def on_stats(stats: dict) -> None:
+                self._set(
+                    collected=stats["collected"],
+                    duplicated=stats["duplicated"],
+                    failed=stats["failed"],
+                    progress=f"已采集 {stats['collected']}",
+                )
+
+            stats = collect_jobs(
+                browser.page,
+                browser.context,
+                self.db,
+                500,
+                self.stop_event,
+                self.pause_event,
+                on_log=self._log,
+                on_stats=on_stats,
+                fetch_detail=False,
+                fresh=True,
+            )
+            self._mark_already_sent()
+            self._set(collected=self.db.count_jobs(), task="空闲", progress=f"已采集 {self.db.count_jobs()}")
+            self._log(f"采集完成：当前页面 {stats['collected']} 个新职位。可以开始筛选投递。")
+        except ManualActionRequired as exc:
+            logger.warning("登录状态异常: %s", exc)
+            self._set(login=str(exc), task="等待用户")
+            self._log(f"登录状态异常: {exc}。自动化已暂停，请在浏览器中手动处理。")
+        except CollectionStopped:
+            self._set(task="已停止")
+            self._log("采集已停止")
+        finally:
+            self._remember_page(browser)
+            self._set_busy(False)
+
+    def _watch_page(self, browser: BrowserSession) -> None:
+        if not self._watch:
+            return
+        with self._lock:
+            if self._busy:
+                return
+        if not browser.is_alive():
+            self._watch = False
+            self._set(browser="未启动", login="未检测", task="空闲")
+            return
+        try:
+            from core.collector import list_mark
+
+            status = browser.classify()
+            self._set(browser="已启动", login=status)
+            if status != "已登录":
+                return
+            mark = list_mark(browser.page)
+        except Exception as exc:
+            if browser_was_closed(exc) or not browser.is_alive():
+                browser.close()
+                self._watch = False
+                self._set(browser="未启动", login="未检测", task="空闲")
+                self._log("浏览器窗口已关闭，可以重新启动")
+            return
+        if not mark or mark == self._page_mark:
+            return
+        if self.stop_event.is_set() and not self._page_mark:
+            return
+        self.stop_event.clear()
+        self._log("检测到职位页面已更换，重新采集")
+        self._auto_collect(browser, replace=True)
+
+    def _wait_if_paused(self) -> None:
+        while self.pause_event.is_set() and not self.stop_event.is_set():
+            time.sleep(0.2)
+        if self.stop_event.is_set():
+            raise CollectionStopped()
+
+    def _screen_and_apply(self, browser: BrowserSession, target: int) -> None:
+        from core.ai_filter import AIError, analyze_job, local_rejection
+        from core.application import should_auto_apply
+        from core.auto_apply import apply_current_job
+        from core.collector import focus_job
+        from core.rules import evaluate_rules
+
+        if not browser.is_alive():
+            browser.close()
+            self._set(browser="未启动", login="未检测", task="空闲")
+            self._log("浏览器窗口已关闭，请重新启动")
+            return
+        target = max(1, min(int(target), 200))
+        self._set(task="筛选投递中", progress=f"0/{target}", applied=0, screened=0)
+        if self.db.count_jobs() == 0:
+            self._log("当前没有职位，先采集这一页")
+            self._auto_collect(browser, replace=True)
+            self._set_busy(True)
+            self._set(task="筛选投递中")
+        profile = load_profile()
+        resume_text = self.db.resume_text()
+        applied = 0
+        try:
+            for job in self.db.jobs_in_collect_order():
+                self._wait_if_paused()
+                if applied >= target:
+                    break
+                if job.get("application_status") == "submitted":
+                    continue
+                job_id = int(job["id"])
+                decision = evaluate_rules(job, profile)
+                if decision.hard_reject:
+                    result = local_rejection(job, profile)
+                    self.db.save_analysis(job_id, result)
+                elif job.get("ai_score") is None:
+                    try:
+                        result = analyze_job(job, profile, resume_text)
+                        self.db.save_analysis(job_id, result)
+                    except AIError:
+                        self.db.record_application(job_id, "failed", "Ollama 调用失败")
+                        self._log(f"筛选失败 {job.get('title')}")
+                        continue
+                else:
+                    result = {
+                        "score": int(job["ai_score"]),
+                        "recommendation": job.get("ai_recommendation") or "",
+                        "hard_reject": bool(job.get("ai_hard_reject")),
+                        "unknown_fields": [],
+                    }
+                self._bump("screened")
+                self._log(f"筛选 {job.get('title')}：{result['score']} {result['recommendation']}")
+                ok, reason = should_auto_apply(result, profile)
+                if not ok:
+                    self.db.record_application(job_id, "skipped", reason)
+                    self._log(f"不投递 {job.get('title')}：{reason}")
+                    continue
+                try:
+                    opened = focus_job(browser.page, job.get("title") or "", job.get("company") or "")
+                except Exception as exc:
+                    if browser_was_closed(exc) or not browser.is_alive():
+                        raise
+                    opened = False
+                if not opened:
+                    self.db.record_application(job_id, "failed", "当前页面没有找到这个职位")
+                    self._log(f"投递失败 {job.get('title')}：当前页面没有找到这个职位")
+                    continue
+                outcome, detail = apply_current_job(browser.page)
+                if outcome in {"submitted", "already"}:
+                    self.db.record_application(job_id, "submitted", detail)
+                    url = job.get("url") or ""
+                    if url:
+                        self._sent_urls.add(url)
+                    if outcome == "submitted":
+                        applied += 1
+                        self._bump("applied")
+                    self._set(progress=f"{applied}/{target}")
+                    self._log(f"{'已投递' if outcome == 'submitted' else '已经投过'} {job.get('title')}：{detail}")
+                    continue
+                logger.error("投递任务失败")
+                self.db.record_application(job_id, "failed", detail)
+                self._log(f"投递失败 {job.get('title')}：{detail}")
+        except ManualActionRequired as exc:
+            self._set(login=str(exc), task="等待用户")
+            self._log(f"登录状态异常: {exc}。自动化已暂停，请在浏览器中手动处理。")
+            return
+        except CollectionStopped:
+            self._set(task="已停止", progress=f"{applied}/{target}")
+            self._log(f"已停止，本批投出 {applied}/{target}")
+            return
+        self._set(task="空闲", progress=f"{applied}/{target}")
+        if applied >= target:
+            self._log(f"本批已投出 {applied} 个，达到设定数量")
+        else:
+            self._log(f"当前列表处理完，实际投出 {applied}/{target}")
+
+    def _clear_and_recollect(self, browser: BrowserSession) -> None:
+        self._sent_urls.clear()
+        self._page_mark = ""
+        self.db.clear_job_list()
+        self._set(collected=0, duplicated=0, failed=0, screened=0, applied=0, progress="0/0", task="采集中")
+        self._log("已清空当前职位")
+        if not browser.is_alive():
+            self._set(browser="未启动", login="未检测", task="空闲")
+            self._log("浏览器未打开，下次打开职位页会重新采集")
+            return
+        try:
+            status = browser.classify()
+        except Exception as exc:
+            if browser_was_closed(exc) or not browser.is_alive():
+                browser.close()
+                self._watch = False
+                self._set(browser="未启动", login="未检测", task="空闲")
+                self._log("浏览器窗口已关闭，可以重新启动")
+                return
+            self._set(task="空闲")
+            self._log(f"登录状态异常: {exc}")
+            return
+        self._set(login=status)
+        if status != "已登录":
+            self._set(task="等待用户")
+            self._log("职位已清空。登录完成后会自动重新采集")
+            return
+        self._log("开始按当前页面重新采集")
+        self._auto_collect(browser, replace=False)
+
+    def _collect(self, browser: BrowserSession, max_count: int, batch: bool = False, refresh: bool = False) -> None:
+        if not browser.is_alive():
+            browser.close()
+            self._set(browser="未启动", login="未检测", task="空闲")
+            self._log("浏览器窗口已关闭，请重新启动")
+            return
+        try:
+            if refresh:
+                status = browser.refresh_job_list(self._entry_url())
+                self._log("推荐页已刷新，开始采集这一批新职位")
+                if status != "已登录":
+                    raise ManualActionRequired(status)
+                self.db.clear_job_list()
+                self._log("已清空旧职位列表，只保留这次刷新出来的职位")
+            else:
+                status = browser.ensure_collection_allowed(self._entry_url())
+        except ManualActionRequired as exc:
+            logger.warning("登录状态异常: %s", exc)
+            self._set(login=str(exc), task="等待用户")
+            self._log(f"登录状态异常: {exc}。自动化已暂停，请在浏览器中手动处理。")
+            return
+        task_name = "筛选投递中" if batch else "采集中"
+        self._set(login=status, task=task_name, progress=f"0/{max_count}")
+        profile = load_profile()
+
+        def on_stats(stats: dict) -> None:
+            done = stats["handled"] if batch else stats["collected"]
+            self._set(
+                collected=stats["collected"],
+                duplicated=stats["duplicated"],
+                failed=stats["failed"],
+                progress=f"{done}/{max_count}",
+            )
+
+        try:
+            stats = collect_jobs(
+                browser.page,
+                browser.context,
+                self.db,
+                max_count,
+                self.stop_event,
+                self.pause_event,
+                on_log=self._log,
+                on_stats=on_stats,
+                on_job=self._on_job(profile, force_rescreen=refresh) if batch else None,
+                count_handled=batch,
+            )
+        except ManualActionRequired as exc:
+            logger.warning("登录状态异常: %s", exc)
+            self._set(login=str(exc), task="等待用户")
+            self._log(f"登录状态异常: {exc}。自动化已暂停，请在浏览器中手动处理。")
+            return
+        except CollectionStopped:
+            self._set(task="已停止")
+            self._log("采集已停止")
+            return
+        if stats.get("stopped") or self.stop_event.is_set():
+            self._set(task="已停止")
+            self._log("任务已停止")
+            return
+        if batch:
+            self._set(task="空闲")
+            self._log(
+                f"批量结束：处理 {stats['handled']}，新增 {stats['collected']}，"
+                f"重复 {stats['duplicated']}，失败 {stats['failed']}"
+            )
+            return
+        self._log(
+            f"采集完成：新增 {stats['collected']}，重复 {stats['duplicated']}，失败 {stats['failed']}。"
+            "进入 AI 分析队列"
+        )
+        self._analyze()
+
+    def _analyze(self) -> None:
+        from core.ai_filter import analyze_pending
+
+        self._set(task="分析中")
+        profile = load_profile()
+        result = analyze_pending(self.db, profile, stop_event=self.stop_event, on_log=self._log)
+        if self.stop_event.is_set():
+            self._set(task="已停止")
+            self._log("分析已停止")
+            return
+        self._set(task="空闲")
+        self._log(f"分析完成：成功 {result['analyzed']}，失败 {result['failed']}")
+
+    def start_browser(self) -> str:
+        with self._lock:
+            if self._busy:
+                return "已有任务在执行，不能同时启动浏览器"
+            self._busy = True
+            self.stop_event.clear()
+            self.snapshot["task"] = "启动浏览器"
+        self._ensure_thread()
+        self._queue.put(("start_browser",))
+        return "正在启动浏览器"
+
+    def refresh_login(self) -> str:
+        with self._lock:
+            if self.snapshot["browser"] != "已启动":
+                return "请先启动浏览器"
+            if self._busy:
+                return "任务进行中"
+            self._busy = True
+        self._ensure_thread()
+        self._queue.put(("refresh_login",))
+        return "正在检查登录状态"
+
+    def start_collect(self, max_count) -> str:
+        try:
+            count = int(max_count)
+        except (TypeError, ValueError):
+            return "采集数量无效"
+        count = max(1, min(300, count))
+        with self._lock:
+            if self.snapshot["browser"] != "已启动":
+                return "请先启动浏览器，并在窗口中完成登录"
+            if self._busy:
+                return "已有采集或分析任务在运行"
+            self._busy = True
+            self.stop_event.clear()
+            self.pause_event.clear()
+            self._active_task = "采集中"
+            self.snapshot.update(
+                {"task": "采集中", "progress": f"0/{count}", "collected": 0, "duplicated": 0, "failed": 0}
+            )
+        self._ensure_thread()
+        self._queue.put(("collect", count))
+        return "已开始采集"
+
+    def start_batch(self, count: int) -> str:
+        count = max(1, min(int(count), 300))
+        with self._lock:
+            if self.snapshot["browser"] != "已启动":
+                return "请先启动浏览器，并在窗口中完成登录"
+            if self._busy:
+                return "已有采集或分析任务在运行"
+            self._busy = True
+            self.stop_event.clear()
+            self.pause_event.clear()
+            self._active_task = "筛选投递中"
+            self.snapshot.update(
+                {
+                    "task": "筛选投递中",
+                    "progress": f"0/{count}",
+                    "collected": 0,
+                    "duplicated": 0,
+                    "failed": 0,
+                    "screened": 0,
+                    "applied": 0,
+                }
+            )
+        self._ensure_thread()
+        self._queue.put(("batch", count))
+        return "已开始批量筛选并投递。通过筛选的职位会点击立即投递，页面确认后才记为已投递。"
+
+    def start_apply(self, count) -> str:
+        try:
+            target = int(count)
+        except (TypeError, ValueError):
+            return "投递数量无效"
+        target = max(1, min(target, 200))
+        with self._lock:
+            if self.snapshot["browser"] != "已启动":
+                return "请先启动浏览器，并在窗口中完成登录"
+            if self._busy:
+                return "采集还在进行，请等这一页采完"
+            self._busy = True
+            self.stop_event.clear()
+            self.pause_event.clear()
+            self._active_task = "筛选投递中"
+            self.snapshot.update(
+                {
+                    "task": "筛选投递中",
+                    "progress": f"0/{target}",
+                    "screened": 0,
+                    "applied": 0,
+                }
+            )
+        self._ensure_thread()
+        self._queue.put(("apply", target))
+        return f"开始筛选并投递，投出 {target} 个就停止"
+
+    def clear_jobs(self) -> str:
+        with self._lock:
+            if self._busy:
+                return "请先停止当前任务"
+            browser_on = self.snapshot["browser"] == "已启动"
+            if browser_on:
+                self._busy = True
+                self.stop_event.clear()
+                self.pause_event.clear()
+                self._active_task = "采集中"
+        if not browser_on:
+            self._sent_urls.clear()
+            self._page_mark = ""
+            self.db.clear_job_list()
+            self._set(collected=0, duplicated=0, failed=0, screened=0, applied=0, progress="0/0")
+            self._log("已清空当前职位")
+            return "已清空当前职位。启动浏览器后会按当前页面重新采集"
+        self._ensure_thread()
+        self._queue.put(("clear_recollect",))
+        return "正在清空当前职位，并按页面重新采集"
+
+    def start_refresh_batch(self, count: int) -> str:
+        count = max(1, min(int(count), 300))
+        with self._lock:
+            if self.snapshot["browser"] != "已启动":
+                return "请先启动浏览器，并在窗口中完成登录"
+            if self._busy:
+                return "已有采集或分析任务在运行"
+            self._busy = True
+            self.stop_event.clear()
+            self.pause_event.clear()
+            self._active_task = "筛选投递中"
+            self.snapshot.update(
+                {
+                    "task": "筛选投递中",
+                    "progress": f"0/{count}",
+                    "collected": 0,
+                    "duplicated": 0,
+                    "failed": 0,
+                    "screened": 0,
+                    "applied": 0,
+                }
+            )
+        self._ensure_thread()
+        self._queue.put(("refresh_batch", count))
+        return "正在刷新推荐页。新出现的职位会重新采集，技能、职责和要求会重新交给 AI。已经投递过的不会再投。"
+
+    def pause_or_resume(self) -> str:
+        with self._lock:
+            task = self.snapshot["task"]
+            if task not in {"采集中", "已暂停", "筛选投递中"}:
+                return "当前没有进行中的采集"
+            if self.pause_event.is_set():
+                self.pause_event.clear()
+                self.snapshot["task"] = self._active_task
+                return "已继续"
+            self.pause_event.set()
+            self.snapshot["task"] = "已暂停"
+            return "已暂停"
+
+    def stop(self) -> str:
+        with self._lock:
+            task = self.snapshot["task"]
+            if task not in {"采集中", "已暂停", "分析中", "启动浏览器", "筛选投递中"}:
+                return "当前没有需要停止的任务"
+        self.stop_event.set()
+        self.pause_event.clear()
+        self._log("正在停止")
+        return "正在停止"
+
+    def close_browser(self) -> str:
+        with self._lock:
+            if self.snapshot["browser"] != "已启动" and not self._busy:
+                return "浏览器未启动"
+            if self._busy and self.snapshot["task"] in {"采集中", "已暂停", "分析中", "筛选投递中"}:
+                return "请先停止当前任务"
+            self._busy = True
+        self.stop_event.set()
+        self._ensure_thread()
+        self._queue.put(("close_browser",))
+        return "正在关闭浏览器"
+
+    def start_analysis(self) -> str:
+        with self._lock:
+            if self._busy:
+                return "已有任务在运行"
+            self._busy = True
+            self.stop_event.clear()
+            self.snapshot["task"] = "分析中"
+        self._ensure_thread()
+        self._queue.put(("analyze",))
+        return "已进入 AI 分析队列"
+
+    def enqueue(self) -> str:
+        try:
+            result = enqueue_recommended(self.db, load_profile())
+        except Exception as exc:
+            logger.error("投递任务失败")
+            return f"投递任务失败: {exc}"
+        return (
+            f"待确认 {result['queued']}，重复 {result['duplicated']}，未通过检查 {result['blocked']}。"
+            "程序不会自动点击立即投递。"
+        )
+
+    def confirm(self, application_id: int) -> str:
+        return confirm_application(self.db, int(application_id))
+
+    def cancel(self, application_id: int) -> str:
+        return cancel_application(self.db, int(application_id))
+
+    def import_jobs(self, path: str) -> str:
+        stats = import_csv(self.db, Path(path))
+        return f"导入完成：新增 {stats['inserted']}，重复 {stats['duplicated']}，失败 {stats['failed']}"
+
+    def save_resume(self, path: str) -> str:
+        file_path = Path(path)
+        text = redact_personal_info(extract_resume_text(file_path))
+        if not text:
+            return "PDF 中没有解析到文本"
+        self.db.save_resume("resume.pdf", text)
+        return f"已保存简历文本 {len(text)} 字。联系方式已去掉，项目经历只使用这份原文。"
+
+    def save_profile_fields(
+        self,
+        roles: str,
+        cities: str,
+        salary_min,
+        salary_max,
+        school: str,
+        major: str,
+        degree: str,
+        graduation_year,
+        skills: str,
+    ) -> str:
+        profile = load_profile()
+        profile["target_roles"] = [line.strip() for line in str(roles).splitlines() if line.strip()]
+        profile["cities"] = [part.strip() for part in str(cities).replace("，", ",").split(",") if part.strip()]
+        profile["salary_min_k"] = int(salary_min)
+        profile["salary_max_k"] = int(salary_max) or None
+        education = dict(profile.get("education") or {})
+        education.update(
+            {
+                "school": school.strip(),
+                "major": major.strip(),
+                "degree": degree.strip(),
+                "graduation_year": int(graduation_year),
+            }
+        )
+        profile["education"] = education
+        profile["skills"] = [part.strip() for part in str(skills).replace("，", ",").split(",") if part.strip()]
+        save_profile(profile)
+        return "求职画像已保存。项目经历只读取已上传简历。"
+
+    def save_filters(
+        self,
+        target_url: str,
+        cities: str,
+        salary_floor,
+        salary_min,
+        roles: str,
+        min_apply_score,
+        experience_years,
+        auto_apply: bool,
+        blocked_titles: str,
+        blocked_keywords: str,
+        preferred_keywords: str,
+        min_company_size,
+    ) -> str:
+        profile = load_profile()
+        url = (target_url or "").strip()
+        if not url.startswith("https://www.zhaopin.com/"):
+            return "筛选网站只接受智联招聘 https 地址"
+        profile["target_url"] = url
+        profile["cities"] = _split_terms(cities)
+        profile["salary_floor_k"] = int(salary_floor)
+        profile["salary_min_k"] = int(salary_min)
+        profile["salary_max_k"] = None
+        profile["min_company_size"] = max(0, int(min_company_size))
+        profile["target_roles"] = _split_lines(roles)
+        profile["blocked_titles"] = _split_terms(blocked_titles)
+        profile["blocked_keywords"] = _split_terms(blocked_keywords)
+        profile["preferred_keywords"] = _split_terms(preferred_keywords)
+        profile["min_apply_score"] = max(0, min(int(min_apply_score), 100))
+        profile["auto_apply"] = bool(auto_apply)
+        rules = dict(profile.get("hard_rules") or {})
+        rules["reject_experience_at_least_years"] = max(0, int(experience_years))
+        profile["hard_rules"] = rules
+        save_profile(profile)
+        return "筛选指标已保存"
+
+    def view(self) -> dict:
+        with self._lock:
+            data = dict(self.snapshot)
+            logs = "\n".join(self.logs)
+        try:
+            jobs = self.db.job_rows()
+            applications = self.db.application_rows()
+            filename = self.db.resume_filename()
+            resume_length = len(self.db.resume_text())
+        except Exception:
+            logger.error("读取数据库失败")
+            jobs, applications, filename, resume_length = [], [], "", 0
+        resume = f"已上传 {filename}，正文 {resume_length} 字" if filename else "尚未上传简历"
+        data.update({"logs": logs, "jobs": jobs, "applications": applications, "resume": resume})
+        return data
