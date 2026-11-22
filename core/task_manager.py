@@ -14,6 +14,7 @@ from core.collector import CollectionStopped, collect_jobs
 from core.database import Database
 from core.importer import import_csv
 from core.logging_config import get_logger
+from core.paths import RESUME_SOURCE_PATH
 from core.profile_store import load_profile, save_profile
 from core.resume_parser import extract_resume_text, redact_personal_info
 
@@ -43,6 +44,7 @@ class CollectController:
         self.pause_event = threading.Event()
         self.stop_event = threading.Event()
         self._watch = False
+        self._collect_interrupted = False
         self._page_mark = ""
         self._sent_urls: set[str] = set()
         self._busy = False
@@ -91,6 +93,7 @@ class CollectController:
             name = command[0]
             try:
                 if name == "shutdown":
+                    self.clear_resume_data()
                     browser.close()
                     break
                 if name == "start_browser":
@@ -105,27 +108,41 @@ class CollectController:
                     self._collect(browser, int(command[1]), batch=True, refresh=True)
                 elif name == "apply":
                     self._screen_and_apply(browser, int(command[1]))
-                elif name == "clear_recollect":
-                    self._clear_and_recollect(browser)
+                elif name == "clear_jobs":
+                    self._clear_jobs_only()
+                elif name == "crawl":
+                    self._crawl_current_page(browser)
                 elif name == "analyze":
                     self._analyze()
                 elif name == "close_browser":
                     self._watch = False
                     browser.close()
+                    self.clear_resume_data()
                     self._set(browser="未启动", login="未检测", task="空闲")
-                    self._log("浏览器已关闭")
+                    self._forget_jobs("浏览器已关闭，职位列表已清空")
             except Exception as exc:
                 if browser_was_closed(exc) or not browser.is_alive():
                     browser.close()
                     self._watch = False
                     self._set(browser="未启动", login="未检测", task="空闲")
-                    self._log("浏览器窗口已关闭，可以重新启动")
+                    self._forget_jobs("浏览器窗口已关闭，职位列表已清空")
                 else:
                     self._log(f"任务失败: {exc}")
                     self._set(task="失败")
             finally:
                 if name != "shutdown":
                     self._set_busy(False)
+
+    def _forget_jobs(self, reason: str) -> None:
+        """Drop the on-screen list. Jobs only exist while the browser session is open."""
+        had_jobs = self.db.count_jobs() > 0
+        self._sent_urls.clear()
+        self._page_mark = ""
+        self._collect_interrupted = False
+        self.db.clear_job_list()
+        self._set(collected=0, duplicated=0, failed=0, screened=0, applied=0, progress="0/0")
+        if had_jobs:
+            self._log(reason)
 
     def _on_browser_disconnected(self) -> None:
         with self._lock:
@@ -135,8 +152,7 @@ class CollectController:
             idle = task not in {"采集中", "已暂停", "筛选投递中", "分析中", "启动浏览器"}
             if idle:
                 self.snapshot["task"] = "空闲"
-        if idle:
-            self._log("浏览器窗口已关闭，可以重新启动")
+        self._forget_jobs("浏览器已关闭，职位列表已清空")
 
     def _start_browser(self, browser: BrowserSession) -> None:
         self._set(task="启动浏览器")
@@ -146,8 +162,11 @@ class CollectController:
                 self._set(browser="已启动", login=status, task="空闲")
                 self._log("浏览器已在运行")
                 self._watch = True
-                if status == "已登录":
-                    self._auto_collect(browser, replace=True)
+                self._remember_page(browser)
+                if status != "已登录":
+                    self._log("请在打开的浏览器里手动登录，然后点「开始采集」。")
+                else:
+                    self._log("已登录。点「开始采集」后再抓当前页职位。")
                 return
             browser.start(on_closed=self._on_browser_disconnected)
             status = browser.open_entry(self._entry_url())
@@ -164,12 +183,11 @@ class CollectController:
         self._set(browser="已启动", login=status, task="空闲")
         self._log(f"浏览器已启动，登录状态：{status}")
         self._watch = True
-        self._page_mark = ""
+        self._remember_page(browser)
         if status == "已登录":
-            self._log("职位页已打开，开始自动采集")
-            self._auto_collect(browser, replace=True)
+            self._log("已登录。只有点「开始采集」或「筛选并投递」才会采集。")
             return
-        self._log("请在打开的浏览器里手动登录。登录完成后会自动采集当前职位。")
+        self._log("请在打开的浏览器里手动登录。登录后点「开始采集」。")
 
     def _refresh_login(self, browser: BrowserSession) -> None:
         if not browser.is_alive():
@@ -240,7 +258,8 @@ class CollectController:
                     "unknown_fields": [],
                 }
             self._bump("screened")
-            self._log(f"筛选 {job.get('title')}：{result['score']} {result['recommendation']}")
+            prior = job.get("prior_apply") or "未识别"
+            self._log(f"筛选 {job.get('title')}：筛选前{prior}，{result['score']} {result['recommendation']}")
             ok, reason = should_auto_apply(result, profile)
             if not ok:
                 self.db.record_application(job_id, "skipped", reason)
@@ -292,7 +311,8 @@ class CollectController:
             if replace:
                 self._capture_sent()
                 self.db.clear_job_list()
-                self._log("页面职位已更换，原先采集的已全部删除")
+                self._collect_interrupted = False
+                self._log("已清空旧职位列表，开始采这一批")
             status = browser.ensure_collection_allowed(self._entry_url())
             if status != "已登录":
                 raise ManualActionRequired(status)
@@ -306,6 +326,7 @@ class CollectController:
                     progress=f"已采集 {stats['collected']}",
                 )
 
+            resume = not replace and (self._collect_interrupted or self.db.count_jobs() > 0)
             stats = collect_jobs(
                 browser.page,
                 browser.context,
@@ -316,23 +337,37 @@ class CollectController:
                 on_log=self._log,
                 on_stats=on_stats,
                 fetch_detail=False,
-                fresh=True,
+                fresh=not resume,
             )
             self._mark_already_sent()
+            if stats.get("stopped") or self.stop_event.is_set():
+                self._collect_interrupted = True
+                self._set(collected=self.db.count_jobs(), task="已停止", progress=f"已采集 {self.db.count_jobs()}")
+                self._log(
+                    f"采集已暂停：当前列表 {self.db.count_jobs()} 个，"
+                    f"其中页面显示继续沟通 {stats.get('already_applied', 0)} 个。再点开始采集会接着往下采。"
+                )
+                return
+            self._collect_interrupted = False
             self._set(collected=self.db.count_jobs(), task="空闲", progress=f"已采集 {self.db.count_jobs()}")
-            self._log(f"采集完成：当前页面 {stats['collected']} 个新职位。可以开始筛选投递。")
+            self._log(
+                f"采集完成：新增 {stats['collected']} 个，继续沟通/已投过 {stats.get('already_applied', 0)} 个。"
+                "可以开始筛选投递。"
+            )
         except ManualActionRequired as exc:
             logger.warning("登录状态异常: %s", exc)
             self._set(login=str(exc), task="等待用户")
             self._log(f"登录状态异常: {exc}。自动化已暂停，请在浏览器中手动处理。")
         except CollectionStopped:
-            self._set(task="已停止")
-            self._log("采集已停止")
+            self._collect_interrupted = True
+            self._set(collected=self.db.count_jobs(), task="已停止", progress=f"已采集 {self.db.count_jobs()}")
+            self._log("采集已停止，再点开始采集会从当前位置继续")
         finally:
             self._remember_page(browser)
             self._set_busy(False)
 
     def _watch_page(self, browser: BrowserSession) -> None:
+        """Only refresh login/browser status. Never auto-collect on page changes."""
         if not self._watch:
             return
         with self._lock:
@@ -357,13 +392,8 @@ class CollectController:
                 self._set(browser="未启动", login="未检测", task="空闲")
                 self._log("浏览器窗口已关闭，可以重新启动")
             return
-        if not mark or mark == self._page_mark:
-            return
-        if self.stop_event.is_set() and not self._page_mark:
-            return
-        self.stop_event.clear()
-        self._log("检测到职位页面已更换，重新采集")
-        self._auto_collect(browser, replace=True)
+        if mark:
+            self._page_mark = mark
 
     def _wait_if_paused(self) -> None:
         while self.pause_event.is_set() and not self.stop_event.is_set():
@@ -371,13 +401,111 @@ class CollectController:
         if self.stop_event.is_set():
             raise CollectionStopped()
 
-    def _screen_and_apply(self, browser: BrowserSession, target: int) -> None:
+    def _apply_jobs_once(self, browser: BrowserSession, profile: dict, resume_text: str, target: int, applied: int) -> int:
         from core.ai_filter import AIError, analyze_job, local_rejection
         from core.application import should_auto_apply
         from core.auto_apply import apply_current_job
         from core.collector import focus_job
         from core.rules import evaluate_rules
 
+        done_statuses = {"submitted", "skipped", "failed"}
+        for job in self.db.jobs_in_collect_order():
+            self._wait_if_paused()
+            if applied >= target:
+                break
+            status = job.get("application_status") or ""
+            if status in done_statuses:
+                continue
+            url = job.get("url") or ""
+            if url and url in self._sent_urls:
+                self.db.record_application(int(job["id"]), "submitted", "本轮已经投递过")
+                continue
+            job_id = int(job["id"])
+            decision = evaluate_rules(job, profile)
+            if decision.hard_reject:
+                result = local_rejection(job, profile)
+                self.db.save_analysis(job_id, result)
+            elif job.get("ai_score") is None:
+                try:
+                    result = analyze_job(job, profile, resume_text)
+                    self.db.save_analysis(job_id, result)
+                except AIError:
+                    self.db.record_application(job_id, "failed", "Ollama 调用失败")
+                    self._log(f"筛选失败 {job.get('title')}")
+                    continue
+            else:
+                result = {
+                    "score": int(job["ai_score"]),
+                    "recommendation": job.get("ai_recommendation") or "",
+                    "hard_reject": bool(job.get("ai_hard_reject")),
+                    "unknown_fields": [],
+                }
+            self._bump("screened")
+            prior = job.get("prior_apply") or "未识别"
+            self._log(f"筛选 {job.get('title')}：筛选前{prior}，{result['score']} {result['recommendation']}")
+            ok, reason = should_auto_apply(result, profile)
+            if not ok:
+                self.db.record_application(job_id, "skipped", reason)
+                self._log(f"不投递 {job.get('title')}：{reason}")
+                continue
+            try:
+                opened = focus_job(browser.page, job.get("title") or "", job.get("company") or "")
+            except Exception as exc:
+                if browser_was_closed(exc) or not browser.is_alive():
+                    raise
+                opened = False
+            if not opened:
+                self.db.record_application(job_id, "failed", "当前页面没有找到这个职位")
+                self._log(f"投递失败 {job.get('title')}：当前页面没有找到这个职位")
+                continue
+            outcome, detail = apply_current_job(browser.page)
+            if outcome in {"submitted", "already"}:
+                self.db.record_application(job_id, "submitted", detail)
+                if url:
+                    self._sent_urls.add(url)
+                if outcome == "submitted":
+                    applied += 1
+                    self._bump("applied")
+                self._set(progress=f"{applied}/{target}")
+                self._log(f"{'已投递' if outcome == 'submitted' else '已经投过'} {job.get('title')}：{detail}")
+                continue
+            logger.error("投递任务失败")
+            self.db.record_application(job_id, "failed", detail)
+            self._log(f"投递失败 {job.get('title')}：{detail}")
+        return applied
+
+    def _collect_next_job(self, browser: BrowserSession) -> int:
+        """Collect exactly one new job. Does not clear the existing list."""
+        from core.collector import collect_jobs
+
+        status = browser.ensure_collection_allowed(self._entry_url())
+        if status != "已登录":
+            raise ManualActionRequired(status)
+        self._set(login=status, task="筛选投递中")
+
+        def on_stats(_stats: dict) -> None:
+            self._set(collected=self.db.count_jobs())
+
+        stats = collect_jobs(
+            browser.page,
+            browser.context,
+            self.db,
+            1,
+            self.stop_event,
+            self.pause_event,
+            on_log=self._log,
+            on_stats=on_stats,
+            fetch_detail=False,
+            fresh=False,
+        )
+        self._mark_already_sent()
+        self._set(collected=self.db.count_jobs())
+        self._remember_page(browser)
+        if stats.get("stopped") or self.stop_event.is_set():
+            raise CollectionStopped()
+        return int(stats.get("collected") or 0)
+
+    def _screen_and_apply(self, browser: BrowserSession, target: int) -> None:
         if not browser.is_alive():
             browser.close()
             self._set(browser="未启动", login="未检测", task="空闲")
@@ -385,73 +513,41 @@ class CollectController:
             return
         target = max(1, min(int(target), 200))
         self._set(task="筛选投递中", progress=f"0/{target}", applied=0, screened=0)
-        if self.db.count_jobs() == 0:
-            self._log("当前没有职位，先采集这一页")
-            self._auto_collect(browser, replace=True)
-            self._set_busy(True)
-            self._set(task="筛选投递中")
+        self._capture_sent()
         profile = load_profile()
         resume_text = self.db.resume_text()
         applied = 0
+        empty_streak = 0
+        refresh_rounds = 0
         try:
-            for job in self.db.jobs_in_collect_order():
+            existing = self.db.count_jobs()
+            if existing > 0:
+                self._log(f"先筛选并投递已采集的 {existing} 个岗位")
+                applied = self._apply_jobs_once(browser, profile, resume_text, target, applied)
+                self._set(progress=f"{applied}/{target}")
+
+            while applied < target and not self.stop_event.is_set():
                 self._wait_if_paused()
-                if applied >= target:
-                    break
-                if job.get("application_status") == "submitted":
-                    continue
-                job_id = int(job["id"])
-                decision = evaluate_rules(job, profile)
-                if decision.hard_reject:
-                    result = local_rejection(job, profile)
-                    self.db.save_analysis(job_id, result)
-                elif job.get("ai_score") is None:
-                    try:
-                        result = analyze_job(job, profile, resume_text)
-                        self.db.save_analysis(job_id, result)
-                    except AIError:
-                        self.db.record_application(job_id, "failed", "Ollama 调用失败")
-                        self._log(f"筛选失败 {job.get('title')}")
+                self._log(f"已投 {applied}/{target}，采集下一个 → AI 筛选 → 通过再投")
+                got = self._collect_next_job(browser)
+                self._set_busy(True)
+                self._set(task="筛选投递中", progress=f"{applied}/{target}")
+                if got <= 0:
+                    empty_streak += 1
+                    if empty_streak >= 2 and refresh_rounds < 20:
+                        self._log("当前列表没有新岗位，刷新页面再继续采一个")
+                        status = browser.refresh_job_list(self._entry_url())
+                        if status != "已登录":
+                            raise ManualActionRequired(status)
+                        self._set(login=status)
+                        refresh_rounds += 1
+                        empty_streak = 0
                         continue
-                else:
-                    result = {
-                        "score": int(job["ai_score"]),
-                        "recommendation": job.get("ai_recommendation") or "",
-                        "hard_reject": bool(job.get("ai_hard_reject")),
-                        "unknown_fields": [],
-                    }
-                self._bump("screened")
-                self._log(f"筛选 {job.get('title')}：{result['score']} {result['recommendation']}")
-                ok, reason = should_auto_apply(result, profile)
-                if not ok:
-                    self.db.record_application(job_id, "skipped", reason)
-                    self._log(f"不投递 {job.get('title')}：{reason}")
-                    continue
-                try:
-                    opened = focus_job(browser.page, job.get("title") or "", job.get("company") or "")
-                except Exception as exc:
-                    if browser_was_closed(exc) or not browser.is_alive():
-                        raise
-                    opened = False
-                if not opened:
-                    self.db.record_application(job_id, "failed", "当前页面没有找到这个职位")
-                    self._log(f"投递失败 {job.get('title')}：当前页面没有找到这个职位")
-                    continue
-                outcome, detail = apply_current_job(browser.page)
-                if outcome in {"submitted", "already"}:
-                    self.db.record_application(job_id, "submitted", detail)
-                    url = job.get("url") or ""
-                    if url:
-                        self._sent_urls.add(url)
-                    if outcome == "submitted":
-                        applied += 1
-                        self._bump("applied")
-                    self._set(progress=f"{applied}/{target}")
-                    self._log(f"{'已投递' if outcome == 'submitted' else '已经投过'} {job.get('title')}：{detail}")
-                    continue
-                logger.error("投递任务失败")
-                self.db.record_application(job_id, "failed", detail)
-                self._log(f"投递失败 {job.get('title')}：{detail}")
+                    self._log("刷不到更多新岗位，结束本批")
+                    break
+                empty_streak = 0
+                applied = self._apply_jobs_once(browser, profile, resume_text, target, applied)
+                self._set(progress=f"{applied}/{target}")
         except ManualActionRequired as exc:
             self._set(login=str(exc), task="等待用户")
             self._log(f"登录状态异常: {exc}。自动化已暂停，请在浏览器中手动处理。")
@@ -464,17 +560,20 @@ class CollectController:
         if applied >= target:
             self._log(f"本批已投出 {applied} 个，达到设定数量")
         else:
-            self._log(f"当前列表处理完，实际投出 {applied}/{target}")
+            self._log(f"续投结束，实际投出 {applied}/{target}")
 
-    def _clear_and_recollect(self, browser: BrowserSession) -> None:
+    def _clear_jobs_only(self) -> None:
         self._sent_urls.clear()
         self._page_mark = ""
+        self._collect_interrupted = False
         self.db.clear_job_list()
-        self._set(collected=0, duplicated=0, failed=0, screened=0, applied=0, progress="0/0", task="采集中")
-        self._log("已清空当前职位")
+        self._set(collected=0, duplicated=0, failed=0, screened=0, applied=0, progress="0/0", task="空闲")
+        self._log("已清空当前职位，不会自动采集")
+
+    def _crawl_current_page(self, browser: BrowserSession) -> None:
         if not browser.is_alive():
             self._set(browser="未启动", login="未检测", task="空闲")
-            self._log("浏览器未打开，下次打开职位页会重新采集")
+            self._log("浏览器未打开，请先启动浏览器")
             return
         try:
             status = browser.classify()
@@ -491,10 +590,15 @@ class CollectController:
         self._set(login=status)
         if status != "已登录":
             self._set(task="等待用户")
-            self._log("职位已清空。登录完成后会自动重新采集")
+            self._log("请先登录，登录后再点「开始采集」。")
             return
-        self._log("开始按当前页面重新采集")
-        self._auto_collect(browser, replace=False)
+        resume = self._collect_interrupted and self.db.count_jobs() > 0
+        if resume:
+            self._log("从上次停下的位置继续采集，已入库岗位会跳过")
+            self._auto_collect(browser, replace=False)
+        else:
+            self._log("开始采集当前页面职位")
+            self._auto_collect(browser, replace=True)
 
     def _collect(self, browser: BrowserSession, max_count: int, batch: bool = False, refresh: bool = False) -> None:
         if not browser.is_alive():
@@ -604,27 +708,73 @@ class CollectController:
         self._queue.put(("refresh_login",))
         return "正在检查登录状态"
 
-    def start_collect(self, max_count) -> str:
-        try:
-            count = int(max_count)
-        except (TypeError, ValueError):
-            return "采集数量无效"
-        count = max(1, min(300, count))
+    def start_collect(self, max_count=None) -> str:
+        """Compatibility entry: without a browser this still asks the user to start one."""
+        if max_count is not None:
+            try:
+                count = int(max_count)
+            except (TypeError, ValueError):
+                return "采集数量无效"
+            count = max(1, min(300, count))
+            with self._lock:
+                if self.snapshot["browser"] != "已启动":
+                    return "请先启动浏览器，并在窗口中完成登录"
+                if self._busy:
+                    return "已有采集或分析任务在运行"
+                self._busy = True
+                self.stop_event.clear()
+                self.pause_event.clear()
+                self._active_task = "采集中"
+                self.snapshot.update(
+                    {"task": "采集中", "progress": f"0/{count}", "collected": 0, "duplicated": 0, "failed": 0}
+                )
+            self._ensure_thread()
+            self._queue.put(("collect", count))
+            return "已开始采集"
+        return self.start_crawl()
+
+    def crawl_button_label(self) -> str:
+        with self._lock:
+            task = self.snapshot["task"]
+        if task in {"采集中", "已暂停"}:
+            return "停止采集"
+        return "开始采集"
+
+    def toggle_crawl(self) -> str:
+        with self._lock:
+            task = self.snapshot["task"]
+        if task in {"采集中", "已暂停"}:
+            return self.stop()
+        return self.start_crawl()
+
+    def start_crawl(self) -> str:
         with self._lock:
             if self.snapshot["browser"] != "已启动":
                 return "请先启动浏览器，并在窗口中完成登录"
             if self._busy:
                 return "已有采集或分析任务在运行"
+            resume = self._collect_interrupted and self.db.count_jobs() > 0
             self._busy = True
             self.stop_event.clear()
             self.pause_event.clear()
             self._active_task = "采集中"
             self.snapshot.update(
-                {"task": "采集中", "progress": f"0/{count}", "collected": 0, "duplicated": 0, "failed": 0}
+                {
+                    "task": "采集中",
+                    "progress": "采集中",
+                    "duplicated": 0,
+                    "failed": 0,
+                    "screened": 0,
+                    "applied": 0,
+                }
             )
+            if not resume:
+                self.snapshot["collected"] = 0
         self._ensure_thread()
-        self._queue.put(("collect", count))
-        return "已开始采集"
+        self._queue.put(("crawl",))
+        if resume:
+            return "继续采集：从上次停下的位置接着往下刷"
+        return "开始采集当前页。点停止采集可暂存进度，再点开始会继续。"
 
     def start_batch(self, count: int) -> str:
         count = max(1, min(int(count), 300))
@@ -683,22 +833,15 @@ class CollectController:
         with self._lock:
             if self._busy:
                 return "请先停止当前任务"
-            browser_on = self.snapshot["browser"] == "已启动"
-            if browser_on:
+            thread_alive = self._thread is not None and self._thread.is_alive()
+            if thread_alive:
                 self._busy = True
-                self.stop_event.clear()
-                self.pause_event.clear()
-                self._active_task = "采集中"
-        if not browser_on:
-            self._sent_urls.clear()
-            self._page_mark = ""
-            self.db.clear_job_list()
-            self._set(collected=0, duplicated=0, failed=0, screened=0, applied=0, progress="0/0")
-            self._log("已清空当前职位")
-            return "已清空当前职位。启动浏览器后会按当前页面重新采集"
+        if not thread_alive:
+            self._clear_jobs_only()
+            return "已清空当前职位。需要时再点「开始采集」或「筛选并投递」。"
         self._ensure_thread()
-        self._queue.put(("clear_recollect",))
-        return "正在清空当前职位，并按页面重新采集"
+        self._queue.put(("clear_jobs",))
+        return "正在清空列表（不会自动采集）"
 
     def start_refresh_batch(self, count: int) -> str:
         count = max(1, min(int(count), 300))
@@ -793,13 +936,29 @@ class CollectController:
         stats = import_csv(self.db, Path(path))
         return f"导入完成：新增 {stats['inserted']}，重复 {stats['duplicated']}，失败 {stats['failed']}"
 
+    def clear_resume_data(self) -> str:
+        self.db.clear_resume()
+        try:
+            if RESUME_SOURCE_PATH.exists():
+                RESUME_SOURCE_PATH.unlink()
+        except Exception:
+            logger.error("简历文件删除失败")
+        self._log("已清空本地简历")
+        return "已清空本地简历"
+
     def save_resume(self, path: str) -> str:
         file_path = Path(path)
         text = redact_personal_info(extract_resume_text(file_path))
         if not text:
             return "PDF 中没有解析到文本"
+        RESUME_SOURCE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            if file_path.resolve() != RESUME_SOURCE_PATH.resolve():
+                RESUME_SOURCE_PATH.write_bytes(file_path.read_bytes())
+        except Exception:
+            logger.error("简历副本保存失败")
         self.db.save_resume("resume.pdf", text)
-        return f"已保存简历文本 {len(text)} 字。联系方式已去掉，项目经历只使用这份原文。"
+        return f"已保存简历文本 {len(text)} 字。联系方式已去掉，项目经历只使用这份原文。关闭程序时会自动清空。"
 
     def save_profile_fields(
         self,
@@ -846,7 +1005,13 @@ class CollectController:
         blocked_keywords: str,
         preferred_keywords: str,
         min_company_size,
+        prefer_active_hr: bool = True,
+        hr_activity_max: str = "本月活跃",
+        job_types=None,
+        prefer_salary_uncapped: bool = True,
     ) -> str:
+        from core.defaults import HR_ACTIVITY_CHOICES, JOB_TYPE_CHOICES
+
         profile = load_profile()
         url = (target_url or "").strip()
         if not url.startswith("https://www.zhaopin.com/"):
@@ -854,9 +1019,18 @@ class CollectController:
         profile["target_url"] = url
         profile["cities"] = _split_terms(cities)
         profile["salary_floor_k"] = int(salary_floor)
-        profile["salary_min_k"] = int(salary_min)
+        profile["salary_min_k"] = int(salary_min) if not prefer_salary_uncapped else int(salary_min or 0)
         profile["salary_max_k"] = None
+        profile["prefer_salary_uncapped"] = bool(prefer_salary_uncapped)
         profile["min_company_size"] = max(0, int(min_company_size))
+        profile["prefer_active_hr"] = bool(prefer_active_hr)
+        activity = str(hr_activity_max or "本月活跃").strip()
+        profile["hr_activity_max"] = activity if activity in HR_ACTIVITY_CHOICES else "本月活跃"
+        if isinstance(job_types, str):
+            selected = _split_terms(job_types)
+        else:
+            selected = [str(item) for item in (job_types or []) if str(item).strip()]
+        profile["job_types"] = [item for item in selected if item in JOB_TYPE_CHOICES] or list(JOB_TYPE_CHOICES)
         profile["target_roles"] = _split_lines(roles)
         profile["blocked_titles"] = _split_terms(blocked_titles)
         profile["blocked_keywords"] = _split_terms(blocked_keywords)
@@ -869,6 +1043,20 @@ class CollectController:
         save_profile(profile)
         return "筛选指标已保存"
 
+    def restore_default_filters(self) -> dict:
+        from copy import deepcopy
+
+        from core.defaults import DEFAULT_PROFILE
+
+        current = load_profile()
+        profile = deepcopy(DEFAULT_PROFILE)
+        for key in ("education", "skills", "projects", "project_policy"):
+            if key in current:
+                profile[key] = current[key]
+        save_profile(profile)
+        self._log("已恢复默认筛选条件")
+        return profile
+
     def view(self) -> dict:
         with self._lock:
             data = dict(self.snapshot)
@@ -878,6 +1066,7 @@ class CollectController:
             applications = self.db.application_rows()
             filename = self.db.resume_filename()
             resume_length = len(self.db.resume_text())
+            data["collected"] = len(jobs)
         except Exception:
             logger.error("读取数据库失败")
             jobs, applications, filename, resume_length = [], [], "", 0

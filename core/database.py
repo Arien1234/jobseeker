@@ -34,6 +34,8 @@ JOB_COLUMNS = {
     "ai_analyzed_at": "TEXT",
     "status": "TEXT NOT NULL DEFAULT 'collected'",
     "company_size": "TEXT NOT NULL DEFAULT ''",
+    "hr_activity": "TEXT NOT NULL DEFAULT ''",
+    "prior_apply": "TEXT NOT NULL DEFAULT ''",
     "created_at": "TEXT NOT NULL DEFAULT ''",
     "updated_at": "TEXT NOT NULL DEFAULT ''",
 }
@@ -184,12 +186,13 @@ class Database:
                         taken = conn.execute("SELECT id FROM jobs WHERE dedup_key = ?", (url_key,)).fetchone()
                         if taken is None:
                             stored_key = url_key
+                    prior = (job.get("prior_apply") or "").strip() or (existing["prior_apply"] or "")
                     conn.execute(
                         """
                         UPDATE jobs
                         SET title = ?, company = ?, salary = ?, location = ?, education = ?,
-                            experience = ?, description = ?, company_size = ?, url = ?, source = ?, collected_at = ?,
-                            dedup_key = ?, updated_at = ?
+                            experience = ?, description = ?, company_size = ?, hr_activity = ?,
+                            prior_apply = ?, url = ?, source = ?, collected_at = ?, dedup_key = ?, updated_at = ?
                         WHERE id = ?
                         """,
                         (
@@ -201,6 +204,8 @@ class Database:
                             job.get("experience") or existing["experience"],
                             description,
                             job.get("company_size") or existing["company_size"] or "",
+                            job.get("hr_activity") or existing["hr_activity"] or "",
+                            prior,
                             canonical_job_url(job.get("url") or "") or existing["url"],
                             job.get("source") or existing["source"],
                             timestamp,
@@ -214,8 +219,9 @@ class Database:
                     """
                     INSERT INTO jobs (
                         title, company, salary, location, education, experience, description,
-                        company_size, url, source, collected_at, dedup_key, status, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'collected', ?, ?)
+                        company_size, hr_activity, prior_apply, url, source, collected_at, dedup_key, status,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'collected', ?, ?)
                     """,
                     (
                         title,
@@ -226,6 +232,8 @@ class Database:
                         job.get("experience") or "",
                         job.get("description") or "",
                         job.get("company_size") or "",
+                        job.get("hr_activity") or "",
+                        (job.get("prior_apply") or "").strip(),
                         canonical_job_url(job.get("url") or ""),
                         job.get("source") or "",
                         timestamp,
@@ -377,30 +385,36 @@ class Database:
             rows = conn.execute(
                 """
                 SELECT j.id, j.title, j.company, j.salary, j.location, j.education, j.experience,
-                       j.company_size, j.ai_score, j.ai_recommendation, j.ai_summary,
-                       a.status AS application_status
+                       j.company_size, j.hr_activity, j.prior_apply, j.ai_score, j.ai_recommendation, j.ai_summary,
+                       a.status AS application_status, a.reason AS application_reason
                 FROM jobs j
                 LEFT JOIN applications a ON a.job_id = j.id
                   AND a.id = (SELECT MAX(id) FROM applications WHERE job_id = j.id)
-                ORDER BY CASE WHEN j.ai_score IS NULL THEN 1 ELSE 0 END, j.ai_score DESC, j.id DESC
+                ORDER BY j.id ASC
                 LIMIT ?
                 """,
                 (limit,),
             ).fetchall()
         result = []
-        for row in rows:
+        for index, row in enumerate(rows, start=1):
             status = row["application_status"] or ""
+            reason = row["application_reason"] or ""
+            prior = (row["prior_apply"] or "").strip() or "未识别"
             if status == "submitted":
-                delivery = "已投递"
+                delivery = "已投递·继续沟通" if "继续沟通" in reason or prior == "已投递" else "已投递"
             elif status == "failed":
                 delivery = "投递失败"
             elif row["ai_score"] is None:
                 delivery = "待筛选"
             else:
                 delivery = "未投递"
+            summary = row["ai_summary"] or ""
+            if row["ai_score"] is not None or summary:
+                summary = f"筛选前：{prior}。" + summary
             result.append(
                 {
-                    "编号": row["id"],
+                    "序号": index,
+                    "岗位详情": "查看",
                     "职位名称": row["title"],
                     "公司": row["company"],
                     "薪资": row["salary"],
@@ -408,13 +422,66 @@ class Database:
                     "学历": row["education"],
                     "工作经验": row["experience"],
                     "公司规模": row["company_size"] or "页面没写",
+                    "HR活跃": row["hr_activity"] or "页面没写",
                     "AI评分": "" if row["ai_score"] is None else int(row["ai_score"]),
                     "AI推荐结果": row["ai_recommendation"] or "",
-                    "筛选说明": row["ai_summary"] or "",
+                    "筛选前": prior,
+                    "筛选说明": summary,
                     "投递状态": delivery,
                 }
             )
         return result
+
+    def job_detail_markdown(self, row_index: int, title: str = "", company: str = "") -> str:
+        with self.transaction() as conn:
+            rows = conn.execute(
+                """
+                SELECT j.*, a.status AS application_status, a.reason AS application_reason
+                FROM jobs j
+                LEFT JOIN applications a ON a.job_id = j.id
+                  AND a.id = (SELECT MAX(id) FROM applications WHERE job_id = j.id)
+                ORDER BY j.id ASC
+                """
+            ).fetchall()
+        chosen = None
+        if title and company:
+            for row in rows:
+                if row["title"] == title and row["company"] == company:
+                    chosen = row
+                    break
+        if chosen is None and 0 <= row_index < len(rows):
+            chosen = rows[row_index]
+        if chosen is None:
+            return "没有找到这条岗位。"
+        prior = (chosen["prior_apply"] or "").strip() or "未识别"
+        jd = (chosen["description"] or "").strip() or "采集时没有读到职位描述。"
+        score = "" if chosen["ai_score"] is None else str(int(chosen["ai_score"]))
+        lines = [
+            f"### {chosen['title']}",
+            f"**{chosen['company']}**",
+            "",
+            "#### 岗位详情",
+            jd,
+            "",
+            "#### 采集信息",
+            f"- 薪资：{chosen['salary'] or '页面没写'}",
+            f"- 地点：{chosen['location'] or '页面没写'}",
+            f"- 学历：{chosen['education'] or '页面没写'}",
+            f"- 经验：{chosen['experience'] or '页面没写'}",
+            f"- 公司规模：{chosen['company_size'] or '页面没写'}",
+            f"- HR 活跃：{chosen['hr_activity'] or '页面没写'}",
+            f"- 筛选前：{prior}",
+            f"- 链接：{chosen['url'] or '没有'}",
+            "",
+            "#### 筛选结果",
+            f"- AI 评分：{score or '还没筛选'}",
+            f"- AI 推荐：{chosen['ai_recommendation'] or '还没筛选'}",
+            f"- 说明：{('筛选前：' + prior + '。') if score or chosen['ai_summary'] else '还没筛选'}"
+            f"{chosen['ai_summary'] or ''}",
+            f"- 投递记录：{(chosen['application_status'] or '无')}"
+            + (f"（{chosen['application_reason']}）" if chosen["application_reason"] else ""),
+        ]
+        return "\n".join(lines)
 
     def submitted_urls(self) -> set[str]:
         with self.transaction() as conn:
@@ -545,3 +612,7 @@ class Database:
         with self.transaction() as conn:
             row = conn.execute("SELECT filename FROM resume_document WHERE id = 1").fetchone()
         return row["filename"] if row else ""
+
+    def clear_resume(self) -> None:
+        with self.transaction() as conn:
+            conn.execute("DELETE FROM resume_document")

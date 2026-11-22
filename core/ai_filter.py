@@ -29,6 +29,8 @@ matched_skills 只能填写画像技能列表中的技能，并且该技能必�
 薪资没有上限。上限越高越好，不得因为薪资高、或薪资区间的下限偏低而降分或拒绝。只要上限不低于保底就可以接受。
 工作地点只看职位地点。客户公司地址、公司总部地址不能当成工作地点。发布方是人力资源或人才经纪公司时，只要职位地点和内容合适，不要因此拒绝。
 公司规模看页面写明的人数。客户公司人数优先，没有客户公司人数时看公司信息里的规模。达到用户设定的人数是加分。规模没写不要拒绝，也不要因此降到 80 分以下。
+HR 活跃状态看页面写明的标签。比用户设定的活跃下限更旧的，由本地规则硬拒绝，你不要再 hard_reject。当前在线或刚刚活跃可在总结里加一句加分。活跃没写不要因此拒绝。
+岗位类型（实习/正式/校招/社招）由本地硬规则处理，你不要因为类型再 hard_reject。
 如果不是必须拒绝，summary 写清简历哪一段对上了职位描述的哪一项，以及可以接受的小瑕疵。
 只输出一个 JSON 对象，不要 Markdown。字段为 score、recommendation、hard_reject、hard_reject_reasons、matched_skills、missing_requirements、unknown_fields、summary。summary 用中文，不超过 180 字。"""
 
@@ -159,6 +161,11 @@ def _favor_reachable_jobs(result: dict, job: dict, profile: dict) -> dict:
         score = 82
     elif high >= prefer and preferred_hits and len(skills) >= 1 and 80 <= score < 96:
         score = min(96, score + 2)
+    activity = job.get("hr_activity") or ""
+    if profile.get("prefer_active_hr", True) and any(
+        marker in activity for marker in ("当前在线", "刚刚活跃", "今日活跃")
+    ):
+        score = min(98, score + 2)
     result["score"] = score
     result["recommendation"] = recommendation_for_score(score)
     return result
@@ -220,9 +227,14 @@ def build_user_message(job: dict, profile: dict, resume_text: str) -> str:
             "education": job.get("education") or "",
             "experience": job.get("experience") or "",
             "company_size": job.get("company_size") or "",
-            "min_company_size": profile.get("min_company_size") or 100,
+            "min_company_size": profile.get("min_company_size") if profile.get("min_company_size") is not None else 20,
+            "hr_activity": job.get("hr_activity") or "",
+            "hr_activity_max": profile.get("hr_activity_max") or "本月活跃",
+            "prefer_active_hr": bool(profile.get("prefer_active_hr", True)),
+            "job_types": profile.get("job_types") or ["实习", "正式", "校招", "社招"],
+            "prefer_salary_uncapped": bool(profile.get("prefer_salary_uncapped", True)),
             "description": job.get("description") or "",
-            "description_note": "description 是完整职位信息，包含技能标签、岗位职责和任职要求，必须整段阅读。",
+            "description_note": "description 是完整职位信息，包含技能标签、岗位职责和任职要求，必须整段阅读。hr_activity 是职位发布者活跃状态。",
         },
     }
     return json.dumps(payload, ensure_ascii=False)

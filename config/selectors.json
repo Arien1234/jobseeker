@@ -27,7 +27,11 @@
     "join_company_label": "join-company-info__label",
     "join_company_value": "join-company-info__value",
     "detail_skill": "describtion-card__skills-item",
-    "detail_description": "describtion-card__detail-content"
+    "detail_description": "describtion-card__detail-content",
+    "panel_publisher_online": "job-detail-publisher__online",
+    "panel_publisher_activity": "job-detail-publisher__activity-tag",
+    "detail_publisher_online": "publisher-seo__online",
+    "detail_publisher_activity": "publisher-seo__activity-tag"
   },
   "pagination": {
     "mode": "document_scroll",
@@ -37,6 +41,8 @@
   "login_phrases": ["扫码登录", "密码登录", "验证码登录", "请登录", "登录/注册", "登录后可查看专属职位推荐", "去登录"],
   "block_phrases": ["安全验证", "滑动验证", "访问验证", "操作过于频繁"],
   "apply_button_text": "立即投递",
+  "apply_button_aliases": ["立即投递", "开始投递"],
+  "already_applied_button_text": "继续沟通",
   "inspection": {
     "recommend_page_observed": true,
     "detail_page_observed": true,

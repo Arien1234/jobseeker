@@ -1,7 +1,7 @@
 """Redaction and the decision to click 立即投递. No browser and no model."""
 
 from core.application import should_auto_apply
-from core.auto_apply import classify_apply_text, dismiss_label
+from core.auto_apply import classify_apply_text, dismiss_label, read_apply_action
 from core.resume_parser import redact_personal_info
 
 PROFILE = {"auto_apply": True, "min_apply_score": 80}
@@ -58,3 +58,24 @@ def test_apply_success_text():
     assert classify_apply_text("已向对方发送简历和打招呼语") == "submitted"
     assert classify_apply_text("请完成安全验证") == "blocked"
     assert classify_apply_text("职位详情") == "failed"
+
+
+class _FakePage:
+    def __init__(self, panel_labels: list[str]):
+        self._panel_labels = panel_labels
+
+    def evaluate(self, script, arg=None):
+        # Whole-page button scan must not be used; only panel labels matter.
+        return list(self._panel_labels)
+
+
+def test_read_apply_action_uses_panel_only():
+    assert read_apply_action(_FakePage(["收藏", "立即投递"])) == "apply"
+    assert read_apply_action(_FakePage(["收藏", "继续沟通"])) == "chat"
+    assert read_apply_action(_FakePage(["开始投递"])) == "apply"
+    assert read_apply_action(_FakePage(["收藏"])) == "unknown"
+
+
+def test_apply_button_wins_over_chat_in_same_panel():
+    # Prefer 立即投递 if both texts somehow appear in the panel payload.
+    assert read_apply_action(_FakePage(["继续沟通", "立即投递"])) == "apply"

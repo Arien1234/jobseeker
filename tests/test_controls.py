@@ -59,3 +59,11 @@ def test_controls_do_not_start_a_second_browser(tmp_path: Path):
     assert "没有需要停止" in controller.stop()
     assert controller.close_browser() == "浏览器未启动"
     assert controller.enqueue().startswith("待确认 0")
+
+
+def test_crawl_button_toggles_label(tmp_path: Path):
+    controller = CollectController(Database(tmp_path / "jobs.db"))
+    assert controller.crawl_button_label() == "开始采集"
+    controller.snapshot["task"] = "采集中"
+    assert controller.crawl_button_label() == "停止采集"
+    assert controller.toggle_crawl() == "正在停止"

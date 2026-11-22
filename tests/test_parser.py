@@ -1,6 +1,16 @@
 """Parser tests against the DOM structure observed on 2026-11-21."""
 
-from core.job_parser import canonical_job_url, company_size_from_html, company_size_text, load_selectors, parse_card_html, parse_detail_html, parse_panel_html
+from core.job_parser import (
+    canonical_job_url,
+    company_size_from_html,
+    company_size_text,
+    hr_activity_from_html,
+    hr_activity_text,
+    load_selectors,
+    parse_card_html,
+    parse_detail_html,
+    parse_panel_html,
+)
 
 CARD_HTML = """
 <div class="job-card job-card--active">
@@ -24,6 +34,14 @@ PANEL_HTML = """
   <div class="job-detail-card">
     <div class="job-detail-card__title">职位描述</div>
     <div class="job-detail-card__body">负责模型推理服务</div>
+  </div>
+  <div class="job-detail-publisher">
+    <div class="job-detail-publisher__name-row">
+      <span>陈女士</span>
+      <span class="job-detail-publisher__online">在线</span>
+      <span class="job-detail-publisher__activity-tag">刚刚活跃</span>
+      <span class="job-detail-publisher__activity-tag">总回复 30+</span>
+    </div>
   </div>
   <a class="job-detail-view-more" href="https://www.zhaopin.com/jobdetail/CCL1480117890J40910946705.htm?srccode=408901">查看更多职位信息</a>
 </div>
@@ -70,6 +88,7 @@ def test_parse_panel_and_canonical_detail_url():
     assert panel["experience"] == "1-3年"
     assert panel["education"] == "本科"
     assert panel["description"] == "负责模型推理服务"
+    assert panel["hr_activity"] == "刚刚活跃 · 总回复 30+"
     assert panel["url"] == "https://www.zhaopin.com/jobdetail/CCL1480117890J40910946705.htm"
     assert canonical_job_url(panel["url"] + "?data_identity=abc") == panel["url"]
 
@@ -135,3 +154,16 @@ def test_company_size_comes_from_the_job_company_block():
     <div class="similar">20-99人</div>
     """
     assert company_size_from_html(direct) == "10000人以上"
+
+
+def test_hr_activity_prefers_the_strongest_label():
+    assert hr_activity_text("在线", "当前在线", "总回复 30+") == "当前在线 · 总回复 30+"
+    assert hr_activity_text("本周活跃") == "本周活跃"
+    html = """
+    <div class="publisher-seo__name-row">
+      <span class="publisher-seo__online">在线</span>
+      <span class="publisher-seo__activity-tag">今日活跃</span>
+      <span class="publisher-seo__activity-tag">总回复 10+</span>
+    </div>
+    """
+    assert hr_activity_from_html(html) == "今日活跃 · 总回复 10+"

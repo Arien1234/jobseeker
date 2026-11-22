@@ -31,6 +31,59 @@ def clean_inline(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
 
 
+_HR_ACTIVITY_RANK = (
+    "当前在线",
+    "刚刚活跃",
+    "今日活跃",
+    "3日内活跃",
+    "本周活跃",
+    "本月活跃",
+    "在线",
+)
+
+
+def hr_activity_text(*parts: str) -> str:
+    """Pick the strongest HR activity label and keep reply volume if present."""
+    labels: list[str] = []
+    replies = ""
+    for part in parts:
+        value = clean_inline(part or "")
+        if not value:
+            continue
+        if value.startswith("总回复"):
+            replies = value
+            continue
+        if value not in labels:
+            labels.append(value)
+    if not labels and not replies:
+        return ""
+    ranked = [item for item in _HR_ACTIVITY_RANK if item in labels]
+    chosen = ranked[0] if ranked else (labels[0] if labels else "")
+    if chosen and replies:
+        return f"{chosen} · {replies}"
+    return chosen or replies
+
+
+def hr_activity_from_html(html: str, classes: dict | None = None) -> str:
+    classes = classes or load_selectors()["classes"]
+    tree = parse_html(html)
+    parts: list[str] = []
+    for key in (
+        "panel_publisher_online",
+        "panel_publisher_activity",
+        "detail_publisher_online",
+        "detail_publisher_activity",
+    ):
+        name = classes.get(key)
+        if not name:
+            continue
+        for node in tree.select(name):
+            text = clean_inline(node.text())
+            if text:
+                parts.append(text)
+    return hr_activity_text(*parts)
+
+
 def company_size_text(text: str) -> str:
     ranges = []
     for match in re.finditer(r"(\d+)\s*[-~～到至]\s*(\d+)\s*人", text or ""):
@@ -220,6 +273,7 @@ def parse_panel_html(html: str, classes: dict | None = None) -> dict:
         "education": meta["education"],
         "experience": meta["experience"],
         "description": description,
+        "hr_activity": hr_activity_from_html(html, classes),
         "url": canonical_job_url(href),
     }
 
@@ -254,5 +308,6 @@ def parse_detail_html(html: str, classes: dict | None = None) -> dict:
         "education": meta["education"],
         "experience": meta["experience"],
         "description": compose_description("\n".join(skills), body),
+        "hr_activity": hr_activity_from_html(html, classes),
         "url": "",
     }

@@ -141,6 +141,33 @@ def test_one_basic_skill_can_still_be_applied():
     assert result["recommendation"] == "推荐投递"
 
 
+def test_active_hr_gets_a_small_boost():
+    flexible = dict(PROFILE)
+    flexible["salary_floor_k"] = 7
+    flexible["prefer_active_hr"] = True
+    payload = parse_ai_payload(
+        '{"score": 80, "recommendation": "推荐投递", "hard_reject": false, "matched_skills": ["Python"], "summary": "方向合适"}'
+    )
+    quiet = apply_policy(payload, _job(salary="10-12K", hr_activity="本月活跃"), flexible)
+    active = apply_policy(payload, _job(salary="10-12K", hr_activity="当前在线 · 总回复 30+"), flexible)
+    assert active["score"] >= quiet["score"]
+    assert active["score"] >= 82
+
+
+def test_hr_activity_and_job_type_are_hard_rules():
+    profile = dict(PROFILE)
+    profile["hr_activity_max"] = "本周活跃"
+    profile["job_types"] = ["正式", "社招"]
+    stale = evaluate_rules(_job(hr_activity="本月活跃"), profile)
+    assert stale.hard_reject
+    fresh = evaluate_rules(_job(hr_activity="刚刚活跃"), profile)
+    assert fresh.hard_reject is False
+    intern = evaluate_rules(_job(title="Python实习生", description="实习岗位"), profile)
+    assert intern.hard_reject
+    full = evaluate_rules(_job(title="Python开发工程师", description="全职社招"), profile)
+    assert full.hard_reject is False
+
+
 def test_slightly_lower_pay_can_still_be_recommended():
     flexible = dict(PROFILE)
     flexible["salary_floor_k"] = 7

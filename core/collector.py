@@ -204,16 +204,48 @@ def _read_company_size(context, url: str) -> str:
         detail.close()
 
 
-def _write_checkpoint(stats: dict, last_url: str) -> None:
+def _write_checkpoint(stats: dict, last_url: str, last_signature: str = "", card_index: int = 0) -> None:
     payload = {
         "collected": stats["collected"],
         "duplicated": stats["duplicated"],
         "failed": stats["failed"],
+        "already_applied": stats.get("already_applied", 0),
         "last_url": last_url,
+        "last_signature": last_signature,
+        "card_index": card_index,
         "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
     }
     CHECKPOINT_PATH.parent.mkdir(parents=True, exist_ok=True)
     CHECKPOINT_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _note_apply_button(job: dict, page, log) -> str:
+    """Read the side-panel button before screening. 继续沟通 means already applied."""
+    from core.auto_apply import read_apply_action
+
+    action = read_apply_action(page)
+    if action == "chat":
+        label = "已投递"
+    elif action == "apply":
+        label = "未投递"
+    else:
+        label = "未识别"
+    job["prior_apply"] = label
+    log(f"筛选前{label}: {job.get('title')} / {job.get('company')}")
+    return label
+
+
+def _mark_already_applied(database: Database, job: dict, log) -> bool:
+    if job.get("prior_apply") != "已投递":
+        return False
+    job_id = database.find_job_id(job)
+    if job_id is None:
+        return False
+    if database.existing_application_status(job) == "submitted":
+        return True
+    database.record_application(job_id, "submitted", "侧栏按钮为继续沟通，筛选前已投递")
+    log(f"已投过（继续沟通）: {job.get('title')} / {job.get('company')}")
+    return True
 
 
 def collect_jobs(
@@ -237,10 +269,13 @@ def collect_jobs(
         "failed": 0,
         "handled": 0,
         "jd_fallback": 0,
+        "already_applied": 0,
         "stopped": False,
     }
     processed: set[str] = set()
     last_url = ""
+    last_signature = ""
+    last_card_index = 0
 
     def log(message: str) -> None:
         if on_stats:
@@ -255,7 +290,7 @@ def collect_jobs(
             logger.error("数据库保存失败")
 
     if CHECKPOINT_PATH.exists() and not fresh:
-        log("检测到上次采集记录，已入库职位会按链接或职位信息跳过")
+        log("从上次采集位置继续：已入库职位会跳过，未采完的会接着往下刷")
 
     scrolls = 0
     while stats["handled" if count_handled else "collected"] < max_count and scrolls < 80:
@@ -362,6 +397,7 @@ def collect_jobs(
                 "experience": panel.get("experience") or "",
                 "description": "",
                 "company_size": company_size_text(panel_html),
+                "hr_activity": panel.get("hr_activity") or "",
                 "url": panel.get("url") or "",
                 "source": SOURCE_NAME,
                 "collected_at": now_text(),
@@ -379,6 +415,8 @@ def collect_jobs(
                         job["company"] = summary["company"] or detail["company"]
                     if detail.get("company_size"):
                         job["company_size"] = detail["company_size"]
+                    if detail.get("hr_activity"):
+                        job["hr_activity"] = detail["hr_activity"]
                 except ManualActionRequired:
                     raise
                 except Exception:
@@ -421,6 +459,7 @@ def collect_jobs(
                 log(f"采集失败: {summary['title']} 没有职位描述")
                 continue
 
+            _note_apply_button(job, page, log)
             try:
                 outcome = database.upsert_job(job)
             except Exception:
@@ -438,6 +477,8 @@ def collect_jobs(
                 log(f"数据库保存失败: {job['title']}")
                 continue
             last_url = job["url"]
+            last_signature = signature
+            last_card_index = index
             if outcome == "inserted":
                 stats["collected"] += 1
                 log(f"已采集 {stats['collected']} {job['title']} / {job['company']}")
@@ -445,11 +486,13 @@ def collect_jobs(
                 stats["duplicated"] += 1
                 logger.info("职位重复: %s / %s", job["title"], job["company"])
                 log(f"职位重复: {job['title']} / {job['company']}")
+            if _mark_already_applied(database, job, log):
+                stats["already_applied"] += 1
             if on_job is not None:
                 on_job(page, job)
             if count_handled:
                 stats["handled"] += 1
-            _write_checkpoint(stats, last_url)
+            _write_checkpoint(stats, last_url, last_signature, last_card_index)
             finished = stats["handled" if count_handled else "collected"]
             if finished < max_count:
                 _reading_gap(stop_event, pause_event, 0.25 if not fetch_detail else random.uniform(1.0, 2.0))
@@ -464,7 +507,7 @@ def collect_jobs(
             break
         log(f"继续下拉，当前列表 {updated} 个职位")
     stats["stopped"] = stop_event.is_set()
-    _write_checkpoint(stats, last_url)
+    _write_checkpoint(stats, last_url, last_signature, last_card_index)
     if on_stats:
         on_stats(dict(stats))
     return stats

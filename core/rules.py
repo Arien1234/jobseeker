@@ -68,6 +68,60 @@ def company_smaller_than(text: str, minimum: int) -> bool:
     return int(ranged.group(2)) < int(minimum)
 
 
+HR_ACTIVITY_LEVELS = (
+    "当前在线",
+    "刚刚活跃",
+    "今日活跃",
+    "3日内活跃",
+    "本周活跃",
+    "本月活跃",
+)
+
+_OLD_ACTIVITY = re.compile(
+    r"半年|几个月|两月|三月|三月前|很久|近期较少|很少活跃|不活跃|月前活跃|年前",
+)
+
+
+def hr_activity_level(text: str) -> int | None:
+    """Return freshness rank. Lower is fresher. None means unknown or missing."""
+    value = (text or "").split("·")[0].strip()
+    if not value:
+        return None
+    if value == "在线" or value.startswith("当前在线"):
+        return 0
+    for index, label in enumerate(HR_ACTIVITY_LEVELS):
+        if label in value:
+            return index
+    if _OLD_ACTIVITY.search(value):
+        return len(HR_ACTIVITY_LEVELS)
+    return None
+
+
+def detect_job_types(job: dict) -> set[str]:
+    blob = "\n".join(
+        [
+            str(job.get("title") or ""),
+            str(job.get("experience") or ""),
+            str(job.get("description") or ""),
+            str(job.get("salary") or ""),
+        ]
+    )
+    found: set[str] = set()
+    if any(token in blob for token in ("实习", "实习生")):
+        found.add("实习")
+    if any(token in blob for token in ("校招", "校园招聘", "应届", "校园")):
+        found.add("校招")
+    if any(token in blob for token in ("社招", "社会招聘")):
+        found.add("社招")
+    if any(token in blob for token in ("正式", "全职", "正式编制")):
+        found.add("正式")
+    if not found:
+        found.add("正式")
+        if any(token in blob for token in ("应届", "经验不限", "在校")):
+            found.add("校招")
+    return found
+
+
 def degree_rejected(education: str, rejected_degrees: list[str]) -> bool:
     if not education:
         return False
@@ -124,9 +178,28 @@ def evaluate_rules(job: dict, profile: dict) -> RuleResult:
     if blocked_keywords:
         reasons.append("必须拒绝：职位信息命中屏蔽词：" + "、".join(blocked_keywords))
 
-    minimum_size = int(profile.get("min_company_size") if profile.get("min_company_size") is not None else 100)
+    minimum_size = int(profile.get("min_company_size") if profile.get("min_company_size") is not None else 20)
     size_text = (job.get("company_size") or "").strip()
     if minimum_size > 0 and size_text and company_smaller_than(size_text, minimum_size):
         reasons.append(f"必须拒绝：公司规模是{size_text}，低于设定的{minimum_size}人")
+
+    allowed_types = set(listed_text(profile.get("job_types")) or ["实习", "正式", "校招", "社招"])
+    job_types = detect_job_types(job)
+    if allowed_types and not (job_types & allowed_types):
+        reasons.append(
+            "必须拒绝：岗位类型是"
+            + "、".join(sorted(job_types))
+            + "，不在已选类型（"
+            + "、".join(sorted(allowed_types))
+            + "）"
+        )
+
+    activity_max = (profile.get("hr_activity_max") or "本月活跃").strip()
+    if activity_max in HR_ACTIVITY_LEVELS:
+        limit = HR_ACTIVITY_LEVELS.index(activity_max)
+        level = hr_activity_level(job.get("hr_activity") or "")
+        if level is not None and level > limit:
+            shown = (job.get("hr_activity") or "").strip() or "过久"
+            reasons.append(f"必须拒绝：HR 活跃状态是{shown}，超过设定的{activity_max}")
 
     return RuleResult(hard_reject=bool(reasons), reasons=reasons, unknown_fields=unknown)
