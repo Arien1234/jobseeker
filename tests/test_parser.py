@@ -66,6 +66,14 @@ DETAIL_HTML = """
 """
 
 
+def test_finished_list_text():
+    from core.collector import list_is_finished
+
+    assert list_is_finished("没有更多了")
+    assert list_is_finished("暂时没有更多职位")
+    assert list_is_finished("继续下拉加载") is False
+
+
 def test_selectors_match_observed_classes():
     classes = load_selectors()["classes"]
     assert classes["card"] == "job-card"

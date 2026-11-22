@@ -113,6 +113,20 @@ def _card_locator(page, classes: dict):
     return page.locator(f"div.{classes['card']}")
 
 
+def list_is_finished(text: str) -> bool:
+    """Zhaopin shows this under the list after the current page has no further jobs."""
+    sample = text or ""
+    return "没有更多" in sample
+
+
+def page_says_no_more(page) -> bool:
+    try:
+        text = page.locator("body").inner_text(timeout=2000)
+    except Exception:
+        return False
+    return list_is_finished(text)
+
+
 def _scroll_for_more(page, classes: dict, previous: int) -> int:
     from playwright.sync_api import TimeoutError as PlaywrightTimeout
 
@@ -270,6 +284,7 @@ def collect_jobs(
         "handled": 0,
         "jd_fallback": 0,
         "already_applied": 0,
+        "exhausted": False,
         "stopped": False,
     }
     processed: set[str] = set()
@@ -502,8 +517,9 @@ def collect_jobs(
         previous = count
         updated = _scroll_for_more(page, classes, previous)
         scrolls += 1
-        if updated <= previous:
-            log("列表没有继续加载，本批停在已经刷到的职位")
+        if updated <= previous or page_says_no_more(page):
+            stats["exhausted"] = True
+            log("这一页没有更多岗位了")
             break
         log(f"继续下拉，当前列表 {updated} 个职位")
     stats["stopped"] = stop_event.is_set()
