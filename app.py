@@ -262,19 +262,49 @@ def _crawl_update():
     return gr.update(value=label, variant="stop" if label == "停止采集" else "primary")
 
 
+_ui_cache = {"table": None, "logs": None, "button": None}
+
+
 def poll():
     state = controller.view()
     jobs = state["jobs"] or []
+    stamp = tuple(
+        (
+            row.get("序号"),
+            row.get("筛选前"),
+            row.get("AI评分"),
+            row.get("投递状态"),
+            row.get("筛选说明"),
+        )
+        for row in jobs
+    )
+    if stamp != _ui_cache["table"]:
+        frame = _frame(jobs, JOB_COLUMNS)
+        _ui_cache["table"] = stamp
+    else:
+        frame = gr.update()
+    logs = state["logs"]
+    if logs != _ui_cache["logs"]:
+        log_out = logs
+        _ui_cache["logs"] = logs
+    else:
+        log_out = gr.update()
+    label = controller.crawl_button_label()
+    if label != _ui_cache["button"]:
+        button = _crawl_update()
+        _ui_cache["button"] = label
+    else:
+        button = gr.update()
     return (
         state["login"],
         state["task"],
         state["progress"],
         str(state["collected"]),
         str(state["applied"]),
-        state["logs"],
-        _frame(jobs, JOB_COLUMNS),
+        log_out,
+        frame,
         state["resume"],
-        _crawl_update(),
+        button,
     )
 
 
@@ -316,6 +346,7 @@ def build_app() -> gr.Blocks:
                 with gr.Column(elem_id="job-toolbar"):
                     with gr.Row(elem_classes=["main-actions"]):
                         start_browser = gr.Button("启动浏览器")
+                        reload_browser = gr.Button("重新加载")
                         start_crawl = gr.Button("开始采集", variant="primary")
                         start_apply = gr.Button("筛选并投递", variant="primary")
                         pause_collect = gr.Button("暂停")
@@ -492,6 +523,7 @@ def build_app() -> gr.Blocks:
         job_table.select(open_job_detail, outputs=[detail_box, job_dialog])
         close_detail.click(lambda: gr.update(visible=False), outputs=job_dialog)
         start_browser.click(controller.start_browser, outputs=action_box)
+        reload_browser.click(controller.reload_browser, outputs=action_box)
         start_crawl.click(toggle_crawl, outputs=[action_box, start_crawl])
         start_apply.click(controller.start_apply, inputs=apply_count, outputs=action_box)
         pause_collect.click(controller.pause_or_resume, outputs=action_box)

@@ -14,9 +14,11 @@ from core.database import Database, now_text
 from core.job_parser import (
     card_signature,
     clean_inline,
+    combo_key_for,
     company_size_from_html,
     company_size_text,
     compose_description,
+    dedup_key_for,
     load_selectors,
     parse_card_html,
     parse_detail_html,
@@ -275,6 +277,7 @@ def collect_jobs(
     count_handled: bool = False,
     fetch_detail: bool = True,
     fresh: bool = False,
+    start_index: int = 0,
 ) -> dict:
     classes = load_selectors()["classes"]
     stats = {
@@ -288,9 +291,12 @@ def collect_jobs(
         "stopped": False,
     }
     processed: set[str] = set()
+    known = database.identity_keys()
     last_url = ""
     last_signature = ""
     last_card_index = 0
+    cursor = max(0, int(start_index))
+    stats["next_index"] = cursor
 
     def log(message: str) -> None:
         if on_stats:
@@ -312,6 +318,8 @@ def collect_jobs(
         _pause_point(stop_event, pause_event)
         cards = _card_locator(page, classes)
         count = cards.count()
+        if cursor > count:
+            cursor = 0
         if count == 0:
             state = page.locator("body").inner_text(timeout=3000)[:800] if page.locator("body").count() else ""
             logged_out = page.locator(".home-header__c-no-login").count() > 0
@@ -322,7 +330,7 @@ def collect_jobs(
             logger.error("职位解析失败: 当前页面没有职位卡片")
             break
 
-        for index in range(count):
+        for index in range(cursor, count):
             if stats["handled" if count_handled else "collected"] >= max_count:
                 break
             _pause_point(stop_event, pause_event)
@@ -362,10 +370,12 @@ def collect_jobs(
                 logger.info("职位重复: %s / %s", summary["title"], summary["company"])
                 log(f"已经投过: {summary['title']} / {summary['company']}")
                 continue
-            if not count_handled and database.job_exists(summary):
+            if not count_handled and (
+                dedup_key_for(summary) in known or combo_key_for(summary) in known
+            ):
                 stats["duplicated"] += 1
-                logger.info("职位重复: %s / %s", summary["title"], summary["company"])
-                log(f"职位重复: {summary['title']} / {summary['company']}")
+                stats["next_index"] = index + 1
+                cursor = index + 1
                 continue
             try:
                 card.locator(f".{classes['card_title']}").scroll_into_view_if_needed(timeout=5000)
@@ -494,6 +504,10 @@ def collect_jobs(
             last_url = job["url"]
             last_signature = signature
             last_card_index = index
+            cursor = index + 1
+            stats["next_index"] = cursor
+            known.add(dedup_key_for(job))
+            known.add(combo_key_for(job))
             if outcome == "inserted":
                 stats["collected"] += 1
                 log(f"已采集 {stats['collected']} {job['title']} / {job['company']}")

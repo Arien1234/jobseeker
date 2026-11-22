@@ -251,7 +251,8 @@ def call_ollama(user_message: str, timeout: int = 180) -> str:
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_message},
             ],
-            "options": {"temperature": 0.1},
+            "options": {"temperature": 0.1, "num_predict": 420},
+            "keep_alive": "30m",
         }
         if include_think:
             payload["think"] = False

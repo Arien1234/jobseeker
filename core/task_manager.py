@@ -46,6 +46,8 @@ class CollectController:
         self._watch = False
         self._collect_interrupted = False
         self._page_mark = ""
+        self._list_head = ""
+        self._card_cursor = 0
         self._sent_urls: set[str] = set()
         self._busy = False
         self._active_task = "采集中"
@@ -120,6 +122,8 @@ class CollectController:
                     self.clear_resume_data()
                     self._set(browser="未启动", login="未检测", task="空闲")
                     self._forget_jobs("浏览器已关闭，职位列表已清空")
+                elif name == "reload_page":
+                    self._reload_page(browser)
             except Exception as exc:
                 if browser_was_closed(exc) or not browser.is_alive():
                     browser.close()
@@ -138,6 +142,8 @@ class CollectController:
         had_jobs = self.db.count_jobs() > 0
         self._sent_urls.clear()
         self._page_mark = ""
+        self._list_head = ""
+        self._card_cursor = 0
         self._collect_interrupted = False
         self.db.clear_job_list()
         self._set(collected=0, duplicated=0, failed=0, screened=0, applied=0, progress="0/0")
@@ -312,6 +318,8 @@ class CollectController:
                 self._capture_sent()
                 self.db.clear_job_list()
                 self._collect_interrupted = False
+                self._card_cursor = 0
+                self._list_head = ""
                 self._log("已清空旧职位列表，开始采这一批")
             status = browser.ensure_collection_allowed(self._entry_url())
             if status != "已登录":
@@ -415,7 +423,7 @@ class CollectController:
         from core.rules import evaluate_rules
 
         done_statuses = {"submitted", "skipped", "failed"}
-        for job in self.db.jobs_in_collect_order():
+        for job in self.db.jobs_pending_apply():
             self._wait_if_paused()
             if applied >= target:
                 break
@@ -488,6 +496,12 @@ class CollectController:
         if status != "已登录":
             raise ManualActionRequired(status)
         self._set(login=status, task="筛选投递中")
+        from core.collector import list_mark
+
+        head = list_mark(browser.page)
+        if head != self._list_head:
+            self._card_cursor = 0
+            self._list_head = head
 
         def on_stats(_stats: dict) -> None:
             self._set(collected=self.db.count_jobs())
@@ -503,12 +517,17 @@ class CollectController:
             on_stats=on_stats,
             fetch_detail=False,
             fresh=False,
+            start_index=self._card_cursor,
         )
         self._mark_already_sent()
         self._set(collected=self.db.count_jobs())
         self._remember_page(browser)
         if stats.get("stopped") or self.stop_event.is_set():
             raise CollectionStopped()
+        if stats.get("exhausted"):
+            self._card_cursor = 0
+        else:
+            self._card_cursor = int(stats.get("next_index") or 0)
         return int(stats.get("collected") or 0), bool(stats.get("exhausted"))
 
     def _screen_and_apply(self, browser: BrowserSession, target: int) -> None:
@@ -536,21 +555,19 @@ class CollectController:
                 got, exhausted = self._collect_next_job(browser)
                 self._set_busy(True)
                 self._set(task="筛选投递中", progress=f"{applied}/{target}")
-                if got > 0 and not exhausted:
-                    applied = self._apply_jobs_once(browser, profile, resume_text, target, applied)
-                    self._set(progress=f"{applied}/{target}")
-                    continue
                 if got > 0:
                     applied = self._apply_jobs_once(browser, profile, resume_text, target, applied)
                     self._set(progress=f"{applied}/{target}")
                 if applied >= target or self.stop_event.is_set():
                     break
-                self._log("这一页显示没有更多了，刷新页面，继续采集筛选投递")
-                status = browser.refresh_job_list(self._entry_url())
-                if status != "已登录":
-                    raise ManualActionRequired(status)
-                self._set(login=status)
-                self._reading_pause(2.0)
+                if got > 0 and not exhausted:
+                    continue
+                self._set(task="空闲", progress=f"{applied}/{target}")
+                self._log(
+                    f"这一页已经没有新岗位，停止投递，本批投出 {applied}/{target}。"
+                    "浏览器保持打开，请自己修改条件并刷出新岗位，再点「筛选并投递」。"
+                )
+                return
         except ManualActionRequired as exc:
             self._set(login=str(exc), task="等待用户")
             self._log(f"登录状态异常: {exc}。自动化已暂停，请在浏览器中手动处理。")
@@ -568,6 +585,8 @@ class CollectController:
     def _clear_jobs_only(self) -> None:
         self._sent_urls.clear()
         self._page_mark = ""
+        self._list_head = ""
+        self._card_cursor = 0
         self._collect_interrupted = False
         self.db.clear_job_list()
         self._set(collected=0, duplicated=0, failed=0, screened=0, applied=0, progress="0/0", task="空闲")
@@ -700,6 +719,44 @@ class CollectController:
         self._queue.put(("start_browser",))
         return "正在启动浏览器"
 
+    def reload_browser(self) -> str:
+        with self._lock:
+            if self.snapshot["browser"] != "已启动":
+                return "请先启动浏览器"
+            if self._busy:
+                return "任务进行中，请先停止再重新加载"
+            self._busy = True
+            self.stop_event.clear()
+            self.snapshot["task"] = "重新加载"
+        self._ensure_thread()
+        self._queue.put(("reload_page",))
+        return "正在点击浏览器重新加载"
+
+    def _reload_page(self, browser: BrowserSession) -> None:
+        if not browser.is_alive():
+            browser.close()
+            self._set(browser="未启动", login="未检测", task="空闲")
+            self._log("浏览器未打开，请先启动浏览器")
+            return
+        self._log("点击浏览器重新加载")
+        try:
+            status = browser.refresh_job_list(self._entry_url())
+        except Exception as exc:
+            if browser_was_closed(exc) or not browser.is_alive():
+                browser.close()
+                self._watch = False
+                self._set(browser="未启动", login="未检测", task="空闲")
+                self._forget_jobs("浏览器窗口已关闭，职位列表已清空")
+                return
+            self._set(task="空闲")
+            self._log(f"重新加载失败: {exc}")
+            return
+        self._set(browser="已启动", login=status, task="空闲")
+        self._remember_page(browser)
+        self._list_head = ""
+        self._card_cursor = 0
+        self._log(f"页面已重新加载，登录状态：{status}")
+
     def refresh_login(self) -> str:
         with self._lock:
             if self.snapshot["browser"] != "已启动":
@@ -830,7 +887,7 @@ class CollectController:
             )
         self._ensure_thread()
         self._queue.put(("apply", target))
-        return f"开始筛选并投递。当前页没有更多岗位时会刷新继续，投出 {target} 个或手动停止才结束"
+        return f"开始筛选并投递，投出 {target} 个或当前页没有新岗位就停止。浏览器会保持打开。"
 
     def clear_jobs(self) -> str:
         with self._lock:

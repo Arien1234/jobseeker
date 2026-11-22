@@ -18,6 +18,24 @@ def test_initialize_creates_tables(tmp_path: Path):
     assert database.count_jobs() == 0
 
 
+def test_pending_jobs_skip_finished(tmp_path: Path):
+    database = Database(tmp_path / "jobs.db")
+    database.upsert_job(
+        {
+            "title": "Python开发",
+            "company": "示例公司",
+            "location": "深圳",
+            "description": "负责 Python 接口",
+            "url": "https://www.zhaopin.com/jobdetail/CCL100J201.htm",
+        }
+    )
+    assert "url:https://www.zhaopin.com/jobdetail/CCL100J201.htm" in database.identity_keys()
+    assert len(database.jobs_pending_apply()) == 1
+    job_id = database.find_job_id({"title": "Python开发", "company": "示例公司", "url": "https://www.zhaopin.com/jobdetail/CCL100J201.htm"})
+    database.record_application(job_id, "skipped", "分数不够")
+    assert database.jobs_pending_apply() == []
+
+
 def test_migration_keeps_existing_rows(tmp_path: Path):
     path = tmp_path / "legacy.db"
     conn = sqlite3.connect(path)

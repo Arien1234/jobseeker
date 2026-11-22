@@ -270,6 +270,32 @@ class Database:
                 ).fetchone()
         return found is not None
 
+    def identity_keys(self) -> set[str]:
+        """Keys already stored, so collection can skip known cards without a query each time."""
+        found: set[str] = set()
+        with self.transaction() as conn:
+            rows = conn.execute("SELECT dedup_key, title, company, location FROM jobs").fetchall()
+        for row in rows:
+            key = row["dedup_key"] or ""
+            if key:
+                found.add(key)
+            found.add(combo_key_for(dict(row)))
+        return found
+
+    def jobs_pending_apply(self) -> list[dict]:
+        with self.transaction() as conn:
+            rows = conn.execute(
+                """
+                SELECT j.*, a.status AS application_status
+                FROM jobs j
+                LEFT JOIN applications a ON a.job_id = j.id
+                  AND a.id = (SELECT MAX(id) FROM applications WHERE job_id = j.id)
+                WHERE a.status IS NULL OR a.status NOT IN ('submitted', 'skipped', 'failed')
+                ORDER BY j.id
+                """
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def find_job_id(self, job: dict) -> int | None:
         url_key = dedup_key_for(job)
         combo_key = combo_key_for(job)

@@ -151,26 +151,36 @@ class BrowserSession:
             logger.info("浏览器已经关闭")
 
     def refresh_job_list(self, url: str) -> str:
+        """Press the address-bar reload button on the current recommend page."""
         from playwright.sync_api import TimeoutError as PlaywrightTimeout
 
         if not self.is_alive():
             raise RuntimeError("浏览器尚未启动")
-        current = self.page.url or ""
+        page = self.page
+        current = page.url or ""
+        if url.split("?")[0] not in current:
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            except PlaywrightTimeout:
+                logger.error("页面加载超时")
+                raise
         try:
-            if url.split("?")[0] in current:
-                self.page.reload(wait_until="domcontentloaded", timeout=45000)
-            else:
-                self.page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            page.bring_to_front()
+        except Exception:
+            logger.info("无法把职位页切到前面")
+        try:
+            page.keyboard.press("F5")
+            page.wait_for_load_state("domcontentloaded", timeout=45000)
         except PlaywrightTimeout:
             logger.error("页面加载超时")
             raise
         try:
-            self.page.wait_for_selector(
+            page.wait_for_selector(
                 "div.job-card, .home-header__c-no-login, h1.summary-planes__title",
-                timeout=12000,
+                timeout=20000,
             )
         except PlaywrightTimeout:
-            logger.warning("页面加载超时: 刷新后未出现职位列表或登录提示")
+            logger.warning("页面加载超时: 重新加载后未出现职位列表或登录提示")
         status = self.classify()
         if status in {"未登录", "需要人工处理验证", "页面状态未知"}:
             logger.warning("登录状态异常: %s", status)
