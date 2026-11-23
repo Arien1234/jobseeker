@@ -14,6 +14,14 @@ from core.paths import DATABASE_PATH
 
 logger = get_logger("database")
 
+
+def application_can_retry(status: str, reason: str) -> bool:
+    """Model outages are not a real apply result, so the next screening pass tries again."""
+    if status != "failed":
+        return False
+    text = reason or ""
+    return text.startswith("模型") or text.startswith("Ollama") or "JSON" in text
+
 JOB_COLUMNS = {
     "title": "TEXT NOT NULL DEFAULT ''",
     "company": "TEXT NOT NULL DEFAULT ''",
@@ -286,11 +294,20 @@ class Database:
         with self.transaction() as conn:
             rows = conn.execute(
                 """
-                SELECT j.*, a.status AS application_status
+                SELECT j.*, a.status AS application_status, a.reason AS application_reason
                 FROM jobs j
                 LEFT JOIN applications a ON a.job_id = j.id
                   AND a.id = (SELECT MAX(id) FROM applications WHERE job_id = j.id)
-                WHERE a.status IS NULL OR a.status NOT IN ('submitted', 'skipped', 'failed')
+                WHERE a.status IS NULL
+                   OR a.status NOT IN ('submitted', 'skipped', 'failed')
+                   OR (
+                        a.status = 'failed'
+                        AND (
+                            a.reason LIKE '模型%'
+                            OR a.reason LIKE 'Ollama%'
+                            OR a.reason LIKE '%JSON%'
+                        )
+                   )
                 ORDER BY j.id
                 """
             ).fetchall()
@@ -406,10 +423,8 @@ class Database:
         with self.transaction() as conn:
             return int(conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0])
 
-    def job_rows(self, limit: int = 500) -> list[dict]:
-        with self.transaction() as conn:
-            rows = conn.execute(
-                """
+    def job_rows(self, limit: int | None = None) -> list[dict]:
+        sql = """
                 SELECT j.id, j.title, j.company, j.salary, j.location, j.education, j.experience,
                        j.company_size, j.hr_activity, j.prior_apply, j.ai_score, j.ai_recommendation, j.ai_summary,
                        a.status AS application_status, a.reason AS application_reason
@@ -417,10 +432,13 @@ class Database:
                 LEFT JOIN applications a ON a.job_id = j.id
                   AND a.id = (SELECT MAX(id) FROM applications WHERE job_id = j.id)
                 ORDER BY j.id ASC
-                LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
+        """
+        params: tuple = ()
+        if limit is not None:
+            sql += " LIMIT ?"
+            params = (int(limit),)
+        with self.transaction() as conn:
+            rows = conn.execute(sql, params).fetchall()
         result = []
         for index, row in enumerate(rows, start=1):
             status = row["application_status"] or ""
@@ -428,6 +446,8 @@ class Database:
             prior = (row["prior_apply"] or "").strip() or "未识别"
             if status == "submitted":
                 delivery = "已投递·继续沟通" if "继续沟通" in reason or prior == "已投递" else "已投递"
+            elif status == "failed" and application_can_retry(status, reason):
+                delivery = "待重试"
             elif status == "failed":
                 delivery = "投递失败"
             elif row["ai_score"] is None:
@@ -435,6 +455,8 @@ class Database:
             else:
                 delivery = "未投递"
             summary = row["ai_summary"] or ""
+            if not summary and application_can_retry(status, reason):
+                summary = reason
             if row["ai_score"] is not None or summary:
                 summary = f"筛选前：{prior}。" + summary
             result.append(
@@ -459,24 +481,24 @@ class Database:
         return result
 
     def job_detail_markdown(self, row_index: int, title: str = "", company: str = "") -> str:
-        with self.transaction() as conn:
-            rows = conn.execute(
-                """
+        detail_sql = """
                 SELECT j.*, a.status AS application_status, a.reason AS application_reason
                 FROM jobs j
                 LEFT JOIN applications a ON a.job_id = j.id
                   AND a.id = (SELECT MAX(id) FROM applications WHERE job_id = j.id)
-                ORDER BY j.id ASC
-                """
-            ).fetchall()
-        chosen = None
-        if title and company:
-            for row in rows:
-                if row["title"] == title and row["company"] == company:
-                    chosen = row
-                    break
-        if chosen is None and 0 <= row_index < len(rows):
-            chosen = rows[row_index]
+        """
+        with self.transaction() as conn:
+            chosen = conn.execute(
+                detail_sql + " ORDER BY j.id ASC LIMIT 1 OFFSET ?",
+                (max(int(row_index), 0),),
+            ).fetchone()
+            if chosen is not None and title and company and (chosen["title"] != title or chosen["company"] != company):
+                chosen = None
+            if chosen is None and title and company:
+                chosen = conn.execute(
+                    detail_sql + " WHERE j.title = ? AND j.company = ? ORDER BY j.id ASC LIMIT 1",
+                    (title, company),
+                ).fetchone()
         if chosen is None:
             return "没有找到这条岗位。"
         prior = (chosen["prior_apply"] or "").strip() or "未识别"

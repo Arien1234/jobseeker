@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import atexit
+import html
+import json
 
-import pandas as pd
 import gradio as gr
 
 from core.defaults import DEFAULT_PROFILE, HR_ACTIVITY_CHOICES, JOB_TYPE_CHOICES
@@ -93,37 +94,179 @@ body, gradio-app, .gradio-container, .gradio-container .main,
   inset: auto !important;
   margin: 0 0 6px !important;
 }
-#job-toolbar .row, #filter-panel .row, .main-actions, .status-row {
+#job-toolbar .row, #filter-panel .row, .status-row {
   flex-wrap: wrap !important;
   gap: 10px !important;
 }
-.main-actions > *, .status-row > *, #filter-panel .row > *, #job-toolbar .row > * {
-  flex: 1 1 180px !important;
-  min-width: min(180px, 100%) !important;
+.browser-actions, .work-actions {
+  flex-wrap: nowrap !important;
+  gap: 10px !important;
 }
-.main-actions button { min-height: 42px; width: 100%; }
+.browser-actions > *, .work-actions > *, .status-row > *, #filter-panel .row > *, #job-toolbar .row > * {
+  flex: 1 1 0 !important;
+  min-width: 0 !important;
+}
+.browser-actions button, .work-actions button {
+  min-height: 42px;
+  width: 100%;
+  white-space: nowrap !important;
+}
 #job-toolbar textarea, #filter-panel textarea { min-height: 42px !important; }
 #job-table {
   width: 100% !important;
   margin-top: 8px;
-  overflow-x: auto !important;
+  overflow: visible !important;
+  max-height: none !important;
 }
-#job-table table { font-size: 14px; min-width: 860px; }
-#job-dialog {
+.job-sheet-label {
+  margin: 0 0 8px;
+  font-weight: 650;
+}
+.job-sheet-scroll {
+  width: 100%;
+  max-height: min(70vh, 760px);
+  overflow: auto;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  border-radius: 0;
+  background: transparent;
+}
+.job-sheet {
+  width: max-content;
+  min-width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  font-size: 14px;
+  line-height: 1.45;
+}
+.job-sheet th,
+.job-sheet td {
+  padding: 7px 10px;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.16);
+  text-align: left;
+  vertical-align: top;
+  white-space: normal;
+  word-break: normal;
+}
+.job-sheet th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  white-space: nowrap;
+  font-weight: 650;
+  background: #141b2b;
+}
+.job-sheet td {
+  min-width: 64px;
+  max-width: 132px;
+  cursor: default;
+  user-select: text;
+}
+.job-sheet td:nth-child(1),
+.job-sheet th:nth-child(1) {
+  width: 48px;
+  min-width: 48px;
+  max-width: 56px;
+}
+.job-sheet td.detail-cell,
+.job-sheet th:nth-child(2) {
+  width: 64px;
+  min-width: 64px;
+  max-width: 72px;
+  white-space: nowrap;
+}
+.job-sheet td:nth-child(3),
+.job-sheet td:nth-child(4) {
+  min-width: 128px;
+  max-width: 156px;
+}
+.job-sheet td:nth-child(14),
+.job-sheet th:nth-child(14) {
+  min-width: 340px;
+  max-width: 380px;
+}
+.job-detail-link {
+  appearance: none;
+  background: transparent;
+  border: 0;
+  padding: 0;
+  margin: 0;
+  color: #8eb7ff;
+  font: inherit;
+  font-weight: 650;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
+.job-detail-link:focus,
+.job-detail-link:focus-visible {
+  outline: none;
+  box-shadow: none;
+}
+#job-detail-pick {
   position: fixed !important;
-  z-index: 3000 !important;
-  left: 50% !important;
-  top: 8vh !important;
-  transform: translateX(-50%);
-  width: min(760px, calc(100vw - 32px)) !important;
-  max-height: 80vh !important;
-  overflow: auto !important;
-  padding: 18px 18px 14px !important;
-  border-radius: 14px !important;
-  background: var(--body-background-fill, #0b0f19) !important;
-  border: 1px solid var(--border-color-primary, #243044) !important;
-  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.45);
+  left: -10000px !important;
+  top: 0 !important;
+  width: 240px !important;
+  height: 40px !important;
+  opacity: 0 !important;
+  overflow: hidden !important;
 }
+#job-modal {
+  position: fixed !important;
+  inset: 0 !important;
+  z-index: 4000 !important;
+  width: 100vw !important;
+  max-width: none !important;
+  height: 100vh !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  background: rgba(6, 10, 18, 0.62) !important;
+  border: 0 !important;
+  box-shadow: none !important;
+  overflow: auto !important;
+  animation: job-mask-in 220ms ease;
+}
+#job-modal.hide,
+#job-modal[hidden] {
+  display: none !important;
+}
+#job-modal.is-closing {
+  animation: job-mask-out 200ms ease forwards;
+}
+#job-dialog {
+  position: relative !important;
+  z-index: 1 !important;
+  width: min(760px, calc(100vw - 48px)) !important;
+  max-height: min(78vh, 820px) !important;
+  overflow: auto !important;
+  margin: 8vh auto !important;
+  padding: 22px 22px 18px !important;
+  border-radius: 18px !important;
+  background: var(--body-background-fill, #0b0f19) !important;
+  border: 1px solid rgba(148, 163, 184, 0.28) !important;
+  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.5);
+  animation: job-pop-in 240ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+#job-modal.is-closing #job-dialog {
+  animation: job-pop-out 200ms ease forwards;
+}
+@keyframes job-mask-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes job-mask-out {
+  from { opacity: 1; }
+  to { opacity: 0; }
+}
+@keyframes job-pop-in {
+  from { opacity: 0; transform: translateY(14px) scale(0.98); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes job-pop-out {
+  from { opacity: 1; transform: none; }
+  to { opacity: 0; transform: translateY(8px) scale(0.985); }
+}
+#job-dialog .prose { max-width: none !important; }
 #filter-panel { padding-bottom: 64px; }
 #resume-card {
   margin-top: 12px;
@@ -170,20 +313,40 @@ body, gradio-app, .gradio-container, .gradio-container .main,
   min-height: 44px !important;
 }
 @media (max-width: 720px) {
-  .main-actions > *, .status-row > * { flex-basis: 100% !important; }
-  #job-table table { min-width: 640px; font-size: 13px; }
+  .browser-actions, .work-actions, .status-row { flex-wrap: wrap !important; }
+  .browser-actions > *, .work-actions > *, .status-row > * { flex-basis: 100% !important; }
+  #job-table table { font-size: 12px; }
 }
 """
 
 
-def _frame(rows: list[dict], columns: list[str]) -> pd.DataFrame:
-    if not rows:
-        return pd.DataFrame({name: pd.Series(dtype="object") for name in columns})
-    frame = pd.DataFrame(rows)
-    for name in columns:
-        if name not in frame.columns:
-            frame[name] = ""
-    return frame[columns]
+def _jobs_html(rows: list[dict]) -> str:
+    head = "".join(f"<th>{html.escape(name)}</th>" for name in JOB_COLUMNS)
+    body = []
+    for row in rows:
+        cells = []
+        for name in JOB_COLUMNS:
+            if name == "岗位详情":
+                title = html.escape(str(row.get("职位名称") or "").replace("\n", " "), quote=True)
+                company = html.escape(str(row.get("公司") or "").replace("\n", " "), quote=True)
+                try:
+                    row_index = int(row.get("序号") or 1) - 1
+                except (TypeError, ValueError):
+                    row_index = 0
+                cells.append(
+                    '<td class="detail-cell">'
+                    f'<button type="button" class="job-detail-link" data-row="{row_index}" '
+                    f'data-title="{title}" data-company="{company}">查看</button>'
+                    "</td>"
+                )
+            else:
+                cells.append(f"<td>{html.escape(str(row.get(name) if row.get(name) is not None else ''))}</td>")
+        body.append("<tr>" + "".join(cells) + "</tr>")
+    return (
+        f'<div class="job-sheet-label">当前职位（{len(rows)}）</div>'
+        '<div class="job-sheet-scroll"><table class="job-sheet">'
+        f"<thead><tr>{head}</tr></thead><tbody>{''.join(body)}</tbody></table></div>"
+    )
 
 
 def _file_path(uploaded) -> str:
@@ -259,13 +422,20 @@ def _restore_defaults():
 
 def _crawl_update():
     label = controller.crawl_button_label()
-    return gr.update(value=label, variant="stop" if label == "停止采集" else "primary")
+    return gr.update(value=label, variant="stop" if label == "停止采集" else "secondary")
 
 
-_ui_cache = {"table": None, "logs": None, "button": None}
+def _apply_update():
+    label = controller.apply_button_label()
+    if label == "停止投递":
+        return gr.update(value=label, variant="secondary")
+    return gr.update(value=label, variant="primary")
 
 
-def poll():
+_ui_cache = {"table": None, "logs": None, "button": None, "apply": None, "action": None}
+
+
+def poll(force_table: bool = False):
     state = controller.view()
     jobs = state["jobs"] or []
     stamp = tuple(
@@ -278,8 +448,8 @@ def poll():
         )
         for row in jobs
     )
-    if stamp != _ui_cache["table"]:
-        frame = _frame(jobs, JOB_COLUMNS)
+    if force_table or stamp != _ui_cache["table"]:
+        frame = gr.update(value=_jobs_html(jobs))
         _ui_cache["table"] = stamp
     else:
         frame = gr.update()
@@ -290,11 +460,23 @@ def poll():
     else:
         log_out = gr.update()
     label = controller.crawl_button_label()
-    if label != _ui_cache["button"]:
+    if force_table or label != _ui_cache["button"]:
         button = _crawl_update()
         _ui_cache["button"] = label
     else:
         button = gr.update()
+    apply_label = controller.apply_button_label()
+    if force_table or apply_label != _ui_cache["apply"]:
+        apply_button = _apply_update()
+        _ui_cache["apply"] = apply_label
+    else:
+        apply_button = gr.update()
+    action = controller.status_text()
+    if force_table or action != _ui_cache["action"]:
+        action_out = action
+        _ui_cache["action"] = action
+    else:
+        action_out = gr.update()
     return (
         state["login"],
         state["task"],
@@ -305,6 +487,8 @@ def poll():
         frame,
         state["resume"],
         button,
+        action_out,
+        apply_button,
     )
 
 
@@ -313,29 +497,33 @@ def toggle_crawl():
     return message, _crawl_update()
 
 
-def open_job_detail(evt: gr.SelectData):
-    index = getattr(evt, "index", None)
-    if not isinstance(index, (list, tuple)) or len(index) < 2:
+def toggle_apply(count):
+    if controller.apply_button_label() == "停止投递":
+        message = controller.stop()
+    else:
+        message = controller.start_apply(count)
+    return message, _apply_update()
+
+
+def open_from_pick(raw: str):
+    if not raw or not str(raw).strip():
         return gr.update(), gr.update()
-    column = int(index[1])
-    if column < 0 or column >= len(JOB_COLUMNS) or JOB_COLUMNS[column] != "岗位详情":
+    try:
+        data = json.loads(raw)
+        row_index = int(data.get("row"))
+    except (TypeError, ValueError, json.JSONDecodeError):
         return gr.update(), gr.update()
-    title = ""
-    company = ""
-    row_value = getattr(evt, "row_value", None)
-    if isinstance(row_value, dict):
-        title = str(row_value.get("职位名称") or "")
-        company = str(row_value.get("公司") or "")
-    elif isinstance(row_value, (list, tuple)) and len(row_value) >= 4:
-        title = str(row_value[2] or "")
-        company = str(row_value[3] or "")
-    detail = controller.db.job_detail_markdown(int(index[0]), title, company)
+    detail = controller.db.job_detail_markdown(
+        row_index,
+        str(data.get("title") or ""),
+        str(data.get("company") or ""),
+    )
     return detail, gr.update(visible=True)
 
 
 def build_app() -> gr.Blocks:
     profile = load_profile()
-    initial_jobs = _frame(controller.view().get("jobs") or [], JOB_COLUMNS)
+    initial_jobs = _jobs_html(controller.view().get("jobs") or [])
 
     with gr.Blocks(title="JobHunter AI") as demo:
         with gr.Column(elem_id="app-top"):
@@ -344,37 +532,39 @@ def build_app() -> gr.Blocks:
         with gr.Tabs():
             with gr.Tab("岗位列表"):
                 with gr.Column(elem_id="job-toolbar"):
-                    with gr.Row(elem_classes=["main-actions"]):
+                    with gr.Row(elem_classes=["browser-actions"]):
                         start_browser = gr.Button("启动浏览器")
                         reload_browser = gr.Button("重新加载")
-                        start_crawl = gr.Button("开始采集", variant="primary")
-                        start_apply = gr.Button("筛选并投递", variant="primary")
-                        pause_collect = gr.Button("暂停")
-                        stop_collect = gr.Button("停止投递")
-                        clear_jobs = gr.Button("清空列表")
                         close_browser = gr.Button("关闭浏览器")
-                    action_box = gr.Textbox(label="操作结果", interactive=False, max_lines=1)
+                    with gr.Row(elem_classes=["work-actions"]):
+                        start_apply = gr.Button("筛选并投递", variant="primary")
+                        start_crawl = gr.Button("仅采集")
+                        pause_collect = gr.Button("暂停")
+                        clear_jobs = gr.Button("清空列表")
+                    action_box = gr.Textbox(
+                        label="操作结果",
+                        value="空闲。可以点「筛选并投递」或「仅采集」。",
+                        interactive=False,
+                        lines=1,
+                        max_lines=2,
+                    )
                     with gr.Row(elem_classes=["status-row"]):
                         login_box = gr.Textbox(label="登录状态", interactive=False, max_lines=1)
                         task_box = gr.Textbox(label="当前任务", interactive=False, max_lines=1)
                         progress_box = gr.Textbox(label="进度", interactive=False, max_lines=1)
                         collected_box = gr.Textbox(label="已采集", interactive=False, max_lines=1)
-                        applied_box = gr.Textbox(label="本批已投递", interactive=False, max_lines=1)
+                        applied_box = gr.Textbox(label="已投递", interactive=False, max_lines=1)
                     apply_count = gr.Slider(1, 200, value=150, step=1, label="本批投递数量")
                     log_box = gr.Textbox(label="实时日志", lines=6, interactive=False)
 
-                with gr.Column(visible=False, elem_id="job-dialog") as job_dialog:
-                    detail_box = gr.Markdown()
-                    close_detail = gr.Button("关闭详情")
+                with gr.Column(visible=False, elem_id="job-modal") as job_dialog:
+                    with gr.Column(elem_id="job-dialog"):
+                        detail_box = gr.Markdown()
+                close_detail = gr.Button("关闭", elem_id="job-dialog-dismiss", visible="hidden")
+                detail_pick = gr.Textbox(elem_id="job-detail-pick", show_label=False)
+                open_detail = gr.Button("打开详情", elem_id="job-detail-open", visible="hidden")
 
-                job_table = gr.Dataframe(
-                        value=initial_jobs,
-                        headers=JOB_COLUMNS,
-                        label=f"当前职位（{len(initial_jobs)}）",
-                        interactive=False,
-                        wrap=True,
-                        elem_id="job-table",
-                    )
+                job_table = gr.HTML(value=initial_jobs, elem_id="job-table")
 
             with gr.Tab("筛选设置"):
                 with gr.Column(elem_id="filter-panel"):
@@ -482,6 +672,8 @@ def build_app() -> gr.Blocks:
             job_table,
             resume_box,
             start_crawl,
+            action_box,
+            start_apply,
         ]
         filter_outputs = [
             filter_message,
@@ -504,7 +696,7 @@ def build_app() -> gr.Blocks:
         timer = gr.Timer(1)
         timer.tick(poll, outputs=outputs, show_progress="hidden")
         demo.load(
-            poll,
+            lambda: poll(force_table=True),
             outputs=outputs,
             js="""
 () => {
@@ -516,18 +708,77 @@ def build_app() -> gr.Blocks:
   };
   join();
   [40, 200, 600].forEach((ms) => setTimeout(join, ms));
+  if (!window.__jobDialogOutside) {
+    window.__jobDialogOutside = true;
+    document.addEventListener('click', (event) => {
+      const link = event.target.closest && event.target.closest('.job-detail-link');
+      if (link) {
+        event.preventDefault();
+        const box = document.querySelector('#job-detail-pick textarea, #job-detail-pick input, textarea#job-detail-pick, input#job-detail-pick');
+        const opener = document.querySelector('#job-detail-open');
+        if (!box || !opener) return;
+        const payload = JSON.stringify({
+          row: link.dataset.row,
+          title: link.dataset.title || '',
+          company: link.dataset.company || '',
+          n: Date.now()
+        });
+        const proto = Object.getOwnPropertyDescriptor(box.constructor.prototype, 'value');
+        if (proto && proto.set) proto.set.call(box, payload);
+        else box.value = payload;
+        opener.click();
+        let tries = 0;
+        const replay = setInterval(() => {
+          tries += 1;
+          const modal = document.querySelector('#job-modal');
+          const shown = modal && getComputedStyle(modal).display !== 'none' && !modal.hidden;
+          if (shown) {
+            modal.classList.remove('is-closing');
+            const dialog = document.querySelector('#job-dialog');
+            modal.style.animation = 'none';
+            if (dialog) dialog.style.animation = 'none';
+            void modal.offsetWidth;
+            modal.style.animation = '';
+            if (dialog) dialog.style.animation = '';
+            clearInterval(replay);
+          } else if (tries > 40) {
+            clearInterval(replay);
+          }
+        }, 40);
+        return;
+      }
+      const modal = document.querySelector('#job-modal');
+      if (!modal) return;
+      const style = getComputedStyle(modal);
+      if (style.display === 'none' || style.visibility === 'hidden' || modal.hidden) return;
+      const dialog = document.querySelector('#job-dialog');
+      if (dialog && dialog.contains(event.target)) return;
+      if (!modal.contains(event.target)) return;
+      if (modal.classList.contains('is-closing')) return;
+      modal.classList.add('is-closing');
+      setTimeout(() => {
+        const button = document.querySelector('#job-dialog-dismiss');
+        if (button) button.click();
+      }, 190);
+    });
+  }
 }
 """,
         )
 
-        job_table.select(open_job_detail, outputs=[detail_box, job_dialog])
+        open_detail.click(
+            open_from_pick,
+            inputs=detail_pick,
+            outputs=[detail_box, job_dialog],
+            show_progress="hidden",
+            js="() => { const box = document.querySelector('#job-detail-pick textarea, #job-detail-pick input, textarea#job-detail-pick, input#job-detail-pick'); return box ? box.value : ''; }",
+        )
         close_detail.click(lambda: gr.update(visible=False), outputs=job_dialog)
         start_browser.click(controller.start_browser, outputs=action_box)
         reload_browser.click(controller.reload_browser, outputs=action_box)
         start_crawl.click(toggle_crawl, outputs=[action_box, start_crawl])
-        start_apply.click(controller.start_apply, inputs=apply_count, outputs=action_box)
+        start_apply.click(toggle_apply, inputs=apply_count, outputs=[action_box, start_apply])
         pause_collect.click(controller.pause_or_resume, outputs=action_box)
-        stop_collect.click(controller.stop, outputs=action_box)
         clear_jobs.click(controller.clear_jobs, outputs=action_box)
         close_browser.click(controller.close_browser, outputs=action_box)
         save_filters.click(

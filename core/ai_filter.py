@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 import urllib.error
 import urllib.request
 
@@ -64,15 +65,65 @@ def _string_list(value) -> list[str]:
     return [clean_inline(str(item)) for item in value if clean_inline(str(item))]
 
 
+def _json_objects(text: str) -> list[str]:
+    value = strip_fence(text)
+    found: list[str] = []
+    if value:
+        found.append(value)
+    start = value.find("{")
+    if start < 0:
+        return found
+    depth = 0
+    in_string = False
+    escape = False
+    for index, char in enumerate(value[start:], start):
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                found.append(value[start : index + 1])
+                break
+    end = value.rfind("}")
+    if end > start:
+        found.append(value[start : end + 1])
+    return found
+
+
+def _load_object(text: str) -> dict | None:
+    repaired = re.sub(r",\s*([}\]])", r"\1", text)
+    for item in (text, repaired):
+        try:
+            data = json.loads(item)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict):
+            return data
+    return None
+
+
 def parse_ai_payload(text: str) -> dict:
-    try:
-        data = json.loads(strip_fence(text))
-    except json.JSONDecodeError as exc:
-        raise AIJsonError("JSON 解析失败") from exc
+    data = None
+    for candidate in _json_objects(text):
+        data = _load_object(candidate)
+        if data is not None and "score" in data:
+            break
+    else:
+        data = None
     if not isinstance(data, dict) or "score" not in data or isinstance(data.get("score"), bool):
         raise AIJsonError("JSON 解析失败")
     try:
-        score = int(data["score"])
+        score = int(float(data["score"]))
     except (TypeError, ValueError) as exc:
         raise AIJsonError("JSON 解析失败") from exc
     score = max(0, min(100, score))
@@ -240,54 +291,89 @@ def build_user_message(job: dict, profile: dict, resume_text: str) -> str:
     return json.dumps(payload, ensure_ascii=False)
 
 
-def call_ollama(user_message: str, timeout: int = 180) -> str:
-    last_error = None
-    for include_think in (True, False):
-        payload = {
-            "model": MODEL,
-            "stream": False,
-            "format": "json",
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_message},
-            ],
-            "options": {"temperature": 0.1, "num_predict": 420},
-            "keep_alive": "30m",
-        }
-        if include_think:
-            payload["think"] = False
-        request = urllib.request.Request(
-            f"{OLLAMA_URL}/api/chat",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                raw = response.read().decode("utf-8")
-            break
-        except urllib.error.HTTPError as exc:
-            last_error = exc
-            if include_think and exc.code == 400:
-                continue
-            logger.error("Ollama 调用失败: HTTP %s", exc.code)
-            raise AIError(f"Ollama 调用失败: HTTP {exc.code}") from exc
-        except Exception as exc:
-            logger.error("Ollama 调用失败: %s", type(exc).__name__)
-            raise AIError("Ollama 调用失败") from exc
-    else:
-        logger.error("Ollama 调用失败: HTTP %s", getattr(last_error, "code", ""))
-        raise AIError("Ollama 调用失败")
+def _post_chat(user_message: str, *, include_think: bool, num_predict: int, timeout: int) -> str:
+    payload = {
+        "model": MODEL,
+        "stream": False,
+        "format": "json",
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_message},
+        ],
+        "options": {"temperature": 0.1, "num_predict": num_predict},
+        "keep_alive": "30m",
+    }
+    if include_think:
+        payload["think"] = False
+    request = urllib.request.Request(
+        f"{OLLAMA_URL}/api/chat",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        raw = response.read().decode("utf-8")
     try:
         data = json.loads(raw)
         content = data["message"]["content"]
     except (KeyError, TypeError, json.JSONDecodeError) as exc:
-        logger.error("JSON 解析失败")
         raise AIJsonError("JSON 解析失败") from exc
-    if not str(content or "").strip():
-        logger.error("Ollama 调用失败: 空回复")
+    text = str(content or "").strip()
+    if not text:
         raise AIError("Ollama 调用失败: 空回复")
-    return str(content)
+    return text
+
+
+def call_ollama(user_message: str, timeout: int = 180) -> str:
+    """Ask the local model. HTTP 500 and empty replies are retried; a longer reply is used after a short answer."""
+    last_error: Exception | None = None
+    allow_think_flag = True
+    for attempt in range(3):
+        if attempt:
+            time.sleep(2 * attempt)
+        num_predict = 900 if attempt else 720
+        try:
+            return _post_chat(
+                user_message,
+                include_think=allow_think_flag,
+                num_predict=num_predict,
+                timeout=timeout,
+            )
+        except urllib.error.HTTPError as exc:
+            last_error = exc
+            if allow_think_flag and exc.code == 400:
+                allow_think_flag = False
+                try:
+                    return _post_chat(
+                        user_message,
+                        include_think=False,
+                        num_predict=num_predict,
+                        timeout=timeout,
+                    )
+                except urllib.error.HTTPError as again:
+                    exc = again
+                    last_error = again
+            if exc.code in (500, 502, 503) and attempt < 2:
+                logger.warning("Ollama HTTP %s，准备重试", exc.code)
+                continue
+            logger.error("Ollama 调用失败: HTTP %s", exc.code)
+            raise AIError(f"Ollama 调用失败: HTTP {exc.code}") from exc
+        except AIError as exc:
+            last_error = exc
+            if attempt < 2:
+                logger.warning("Ollama 回复不可用，准备重试")
+                continue
+            logger.error("Ollama 调用失败: %s", exc)
+            raise
+        except Exception as exc:
+            last_error = exc
+            if attempt < 2:
+                logger.warning("Ollama 调用失败: %s，准备重试", type(exc).__name__)
+                continue
+            logger.error("Ollama 调用失败: %s", type(exc).__name__)
+            raise AIError("Ollama 调用失败") from exc
+    logger.error("Ollama 调用失败")
+    raise AIError("Ollama 调用失败") from last_error
 
 
 def analyze_job(job: dict, profile: dict, resume_text: str, api_key: str | None = None) -> dict:
@@ -296,12 +382,21 @@ def analyze_job(job: dict, profile: dict, resume_text: str, api_key: str | None 
         return rejected
     decision = evaluate_rules(job, profile)
     message = build_user_message(job, profile, resume_text)
-    content = call_ollama(message)
-    try:
-        payload = parse_ai_payload(content)
-    except AIJsonError:
-        logger.error("JSON 解析失败")
-        raise
+    content = ""
+    payload = None
+    for attempt in range(2):
+        content = call_ollama(message)
+        try:
+            payload = parse_ai_payload(content)
+            break
+        except AIJsonError:
+            if attempt == 0:
+                logger.warning("JSON 解析失败，再请求一次")
+                continue
+            logger.error("JSON 解析失败: %s", clean_inline(content)[:80])
+            raise AIJsonError("模型没有返回完整 JSON")
+    if payload is None:
+        raise AIJsonError("模型没有返回完整 JSON")
     result = apply_policy(payload, job, profile, decision.unknown_fields)
     result["source"] = MODEL
     stored = dict(result)

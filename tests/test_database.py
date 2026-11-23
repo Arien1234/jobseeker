@@ -35,6 +35,29 @@ def test_pending_jobs_skip_finished(tmp_path: Path):
     database.record_application(job_id, "skipped", "分数不够")
     assert database.jobs_pending_apply() == []
 
+    database.record_application(job_id, "failed", "Ollama 调用失败")
+    pending = database.jobs_pending_apply()
+    assert [row["id"] for row in pending] == [job_id]
+    database.record_application(job_id, "failed", "页面没有投递按钮")
+    assert database.jobs_pending_apply() == []
+
+
+def test_job_rows_are_not_capped_at_500(tmp_path: Path):
+    database = Database(tmp_path / "jobs.db")
+    for index in range(3):
+        database.upsert_job(
+            {
+                "title": f"岗位{index}",
+                "company": "示例公司",
+                "location": "深圳",
+                "description": "负责接口",
+                "url": f"https://www.zhaopin.com/jobdetail/CC{index}.htm",
+            }
+        )
+    assert len(database.job_rows()) == 3
+    assert len(database.job_rows(limit=1)) == 1
+    assert "负责接口" in database.job_detail_markdown(2, "岗位2", "示例公司")
+
 
 def test_migration_keeps_existing_rows(tmp_path: Path):
     path = tmp_path / "legacy.db"

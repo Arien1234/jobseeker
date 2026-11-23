@@ -63,6 +63,16 @@ def test_invalid_json_raises():
         parse_ai_payload('{"recommendation": "优先投递"}')
 
 
+def test_json_buried_in_prose_still_parses():
+    text = """筛选结果如下：
+{"score": "86.0", "recommendation": "推荐投递", "hard_reject": false, "summary": "基础技能对得上",}
+后面还有一句说明。"""
+    payload = parse_ai_payload(text)
+    assert payload["score"] == 86
+    assert payload["recommendation"] == "推荐投递"
+    assert payload["summary"] == "基础技能对得上"
+
+
 def test_unknown_salary_cannot_be_treated_as_match():
     payload = parse_ai_payload(
         '{"score": 96, "recommendation": "优先投递", "hard_reject": false, "summary": "看起来合适"}'

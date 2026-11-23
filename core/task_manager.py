@@ -11,7 +11,7 @@ from pathlib import Path
 from core.application import cancel_application, confirm_application, enqueue_recommended
 from core.browser import BrowserSession, ManualActionRequired, browser_was_closed
 from core.collector import CollectionStopped, collect_jobs
-from core.database import Database
+from core.database import Database, application_can_retry
 from core.importer import import_csv
 from core.logging_config import get_logger
 from core.paths import RESUME_SOURCE_PATH
@@ -49,8 +49,15 @@ class CollectController:
         self._list_head = ""
         self._card_cursor = 0
         self._sent_urls: set[str] = set()
+        self._model_give_up: set[int] = set()
         self._busy = False
         self._active_task = "采集中"
+        self._stopping = False
+        self._seen_jobs = 0
+        self._seen_applied = 0
+        self._session_collected = 0
+        self._session_applied = 0
+        self._notice = "空闲。可以点「筛选并投递」或「仅采集」。"
         self.logs: deque[str] = deque(maxlen=200)
         self.snapshot = {
             "browser": "未启动",
@@ -66,7 +73,99 @@ class CollectController:
 
     def _set(self, **values) -> None:
         with self._lock:
+            values.pop("collected", None)
+            values.pop("applied", None)
+            previous = self.snapshot.get("task")
             self.snapshot.update(values)
+            self.snapshot["collected"] = self._session_collected
+            self.snapshot["applied"] = self._session_applied
+            task = self.snapshot.get("task")
+            if task in {"空闲", "已停止", "失败", "等待用户"}:
+                was_stopping = self._stopping
+                self._stopping = False
+                if was_stopping or previous in {"筛选投递中", "采集中", "已暂停", "分析中", "启动浏览器", "重新加载"} or task in {"已停止", "失败", "等待用户"}:
+                    if task != previous or was_stopping or task in {"已停止", "失败", "等待用户"}:
+                        self._notice = self._result_text(previous, task, was_stopping)
+            elif task in {"筛选投递中", "采集中", "已暂停", "分析中", "启动浏览器", "重新加载"}:
+                self._notice = self._busy_text()
+
+    def _note_list_cleared(self) -> None:
+        """List rows were deleted. Keep the session totals and count later inserts as new."""
+        with self._lock:
+            self._seen_jobs = 0
+            self._seen_applied = 0
+
+    def _submitted_count(self) -> int:
+        with self.db.transaction() as conn:
+            row = conn.execute("SELECT COUNT(*) FROM applications WHERE status = 'submitted'").fetchone()
+        return int(row[0] or 0)
+
+    def _busy_text(self) -> str:
+        task = self.snapshot.get("task") or ""
+        progress = self.snapshot.get("progress") or ""
+        active = self._active_task
+        if self._stopping:
+            if task == "筛选投递中" or (task == "已暂停" and active == "筛选投递中"):
+                return f"正在停止筛选并投递，等当前岗位处理完。进度 {progress}。"
+            if task == "采集中" or (task == "已暂停" and active == "采集中"):
+                return f"正在停止仅采集，等当前岗位处理完。进度 {progress}。"
+            return f"正在停止当前任务，等它处理完。进度 {progress}。"
+        if task == "筛选投递中":
+            return f"正在筛选并投递，本轮进度 {progress}。"
+        if task == "采集中":
+            return f"正在仅采集，进度 {progress}。"
+        if task == "已暂停":
+            name = "筛选并投递" if active == "筛选投递中" else "仅采集"
+            return f"已暂停{name}，进度 {progress}。"
+        if task == "启动浏览器":
+            return "正在启动浏览器。"
+        if task == "重新加载":
+            return "正在重新加载浏览器页面。"
+        if task == "分析中":
+            return "正在分析已采集的岗位。"
+        return f"当前任务：{task}。"
+
+    def _result_text(self, previous: str, task: str, was_stopping: bool) -> str:
+        progress = self.snapshot.get("progress") or ""
+        applied = self._session_applied
+        collected = self._session_collected
+        active = self._active_task
+        if task == "等待用户":
+            return "等待你在浏览器里处理登录或验证。处理完再点「筛选并投递」或「仅采集」。"
+        if task == "失败":
+            return "任务失败了。看下面的实时日志，处理完可以再试。"
+        if previous == "启动浏览器":
+            if self.snapshot.get("browser") == "已启动":
+                return f"浏览器已启动，登录状态：{self.snapshot.get('login')}。可以点「筛选并投递」或「仅采集」。"
+            return "浏览器没有启动成功。看实时日志里的原因。"
+        if previous == "重新加载":
+            if self.snapshot.get("browser") == "已启动":
+                return f"浏览器页面已重新加载，登录状态：{self.snapshot.get('login')}。"
+            return "重新加载没有完成。浏览器可能已关闭。"
+        if was_stopping or task == "已停止":
+            if active == "筛选投递中" or previous == "筛选投递中":
+                return f"筛选并投递已停止，当前岗位已处理完。进度 {progress}。这次启动后累计已投递 {applied} 个。"
+            if active == "采集中" or previous == "采集中":
+                return f"仅采集已停止，当前岗位已处理完。进度 {progress}。这次启动后累计已采集 {collected} 个。"
+            return f"当前任务已处理完并停止。进度 {progress}。"
+        if previous == "筛选投递中" or active == "筛选投递中":
+            return f"筛选并投递这一轮结束了。进度 {progress}。这次启动后累计已投递 {applied} 个，已采集 {collected} 个。"
+        if previous == "采集中" or active == "采集中":
+            return f"仅采集结束了。进度 {progress}。这次启动后累计已采集 {collected} 个。"
+        if previous == "分析中":
+            return "分析结束了。看实时日志里的结果。"
+        return self._notice or "空闲。可以点「筛选并投递」或「仅采集」。"
+
+    def status_text(self) -> str:
+        with self._lock:
+            task = self.snapshot.get("task")
+            if self._stopping or task in {"筛选投递中", "采集中", "已暂停", "分析中", "启动浏览器", "重新加载"}:
+                return self._busy_text()
+            return self._notice or "空闲。可以点「筛选并投递」或「仅采集」。"
+
+    def _keep_totals(self) -> None:
+        self.snapshot["collected"] = self._session_collected
+        self.snapshot["applied"] = self._session_applied
 
     def _set_busy(self, busy: bool) -> None:
         with self._lock:
@@ -122,6 +221,8 @@ class CollectController:
                     self.clear_resume_data()
                     self._set(browser="未启动", login="未检测", task="空闲")
                     self._forget_jobs("浏览器已关闭，职位列表已清空")
+                    with self._lock:
+                        self._notice = "浏览器已关闭。已采集和已投递仍是这次启动后的累计。"
                 elif name == "reload_page":
                     self._reload_page(browser)
             except Exception as exc:
@@ -146,7 +247,8 @@ class CollectController:
         self._card_cursor = 0
         self._collect_interrupted = False
         self.db.clear_job_list()
-        self._set(collected=0, duplicated=0, failed=0, screened=0, applied=0, progress="0/0")
+        self._note_list_cleared()
+        self._set(duplicated=0, failed=0, screened=0, progress="0/0")
         if had_jobs:
             self._log(reason)
 
@@ -170,9 +272,9 @@ class CollectController:
                 self._watch = True
                 self._remember_page(browser)
                 if status != "已登录":
-                    self._log("请在打开的浏览器里手动登录，然后点「开始采集」。")
+                    self._log("请在打开的浏览器里手动登录，然后点「仅采集」。")
                 else:
-                    self._log("已登录。点「开始采集」后再抓当前页职位。")
+                    self._log("已登录。点「仅采集」后再抓当前页职位。")
                 return
             browser.start(on_closed=self._on_browser_disconnected)
             status = browser.open_entry(self._entry_url())
@@ -191,9 +293,9 @@ class CollectController:
         self._watch = True
         self._remember_page(browser)
         if status == "已登录":
-            self._log("已登录。只有点「开始采集」或「筛选并投递」才会采集。")
+            self._log("已登录。只有点「仅采集」或「筛选并投递」才会采集。")
             return
-        self._log("请在打开的浏览器里手动登录。登录后点「开始采集」。")
+        self._log("请在打开的浏览器里手动登录。登录后点「仅采集」。")
 
     def _refresh_login(self, browser: BrowserSession) -> None:
         if not browser.is_alive():
@@ -252,9 +354,10 @@ class CollectController:
                 try:
                     result = analyze_job(stored, profile, resume_text)
                     self.db.save_analysis(job_id, result)
-                except AIError:
-                    self.db.record_application(job_id, "failed", "Ollama 调用失败")
-                    self._log(f"筛选失败 {job.get('title')}")
+                except AIError as exc:
+                    self._model_give_up.add(job_id)
+                    self.db.record_application(job_id, "failed", "模型暂时失败，下次筛选会重试")
+                    self._log(f"筛选暂时失败 {job.get('title')}：{exc}。本轮先跳过，下次再试")
                     return
             else:
                 result = {
@@ -274,8 +377,6 @@ class CollectController:
             outcome, detail = apply_current_job(page)
             if outcome in {"submitted", "already"}:
                 self.db.record_application(job_id, "submitted", detail)
-                if outcome == "submitted":
-                    self._bump("applied")
                 self._log(f"{'已投递' if outcome == 'submitted' else '已经投过'} {job.get('title')}：{detail}")
                 return
             logger.error("投递任务失败")
@@ -317,6 +418,7 @@ class CollectController:
             if replace:
                 self._capture_sent()
                 self.db.clear_job_list()
+                self._note_list_cleared()
                 self._collect_interrupted = False
                 self._card_cursor = 0
                 self._list_head = ""
@@ -328,10 +430,9 @@ class CollectController:
 
             def on_stats(stats: dict) -> None:
                 self._set(
-                    collected=stats["collected"],
                     duplicated=stats["duplicated"],
                     failed=stats["failed"],
-                    progress=f"已采集 {stats['collected']}",
+                    progress=f"本轮新增 {stats['collected']}",
                 )
 
             resume = not replace and (self._collect_interrupted or self.db.count_jobs() > 0)
@@ -350,14 +451,14 @@ class CollectController:
             self._mark_already_sent()
             if stats.get("stopped") or self.stop_event.is_set():
                 self._collect_interrupted = True
-                self._set(collected=self.db.count_jobs(), task="已停止", progress=f"已采集 {self.db.count_jobs()}")
+                self._set(task="已停止", progress=f"本轮新增 {stats.get('collected', 0)}")
                 self._log(
                     f"采集已暂停：当前列表 {self.db.count_jobs()} 个，"
-                    f"其中页面显示继续沟通 {stats.get('already_applied', 0)} 个。再点开始采集会接着往下采。"
+                    f"其中页面显示继续沟通 {stats.get('already_applied', 0)} 个。再点仅采集会接着往下采。"
                 )
                 return
             self._collect_interrupted = False
-            self._set(collected=self.db.count_jobs(), task="空闲", progress=f"已采集 {self.db.count_jobs()}")
+            self._set(task="空闲", progress=f"本轮新增 {stats.get('collected', 0)}")
             self._log(
                 f"采集完成：新增 {stats['collected']} 个，继续沟通/已投过 {stats.get('already_applied', 0)} 个。"
                 "可以开始筛选投递。"
@@ -368,8 +469,8 @@ class CollectController:
             self._log(f"登录状态异常: {exc}。自动化已暂停，请在浏览器中手动处理。")
         except CollectionStopped:
             self._collect_interrupted = True
-            self._set(collected=self.db.count_jobs(), task="已停止", progress=f"已采集 {self.db.count_jobs()}")
-            self._log("采集已停止，再点开始采集会从当前位置继续")
+            self._set(task="已停止", progress="已停止")
+            self._log("仅采集已停止，再点仅采集会从当前位置继续")
         finally:
             self._remember_page(browser)
             self._set_busy(False)
@@ -422,19 +523,20 @@ class CollectController:
         from core.collector import focus_job
         from core.rules import evaluate_rules
 
-        done_statuses = {"submitted", "skipped", "failed"}
         for job in self.db.jobs_pending_apply():
             self._wait_if_paused()
             if applied >= target:
                 break
             status = job.get("application_status") or ""
-            if status in done_statuses:
+            job_id = int(job["id"])
+            if status in {"submitted", "skipped"} or job_id in self._model_give_up:
+                continue
+            if status == "failed" and not application_can_retry(status, job.get("application_reason") or ""):
                 continue
             url = job.get("url") or ""
             if url and url in self._sent_urls:
                 self.db.record_application(int(job["id"]), "submitted", "本轮已经投递过")
                 continue
-            job_id = int(job["id"])
             decision = evaluate_rules(job, profile)
             if decision.hard_reject:
                 result = local_rejection(job, profile)
@@ -443,9 +545,10 @@ class CollectController:
                 try:
                     result = analyze_job(job, profile, resume_text)
                     self.db.save_analysis(job_id, result)
-                except AIError:
-                    self.db.record_application(job_id, "failed", "Ollama 调用失败")
-                    self._log(f"筛选失败 {job.get('title')}")
+                except AIError as exc:
+                    self._model_give_up.add(job_id)
+                    self.db.record_application(job_id, "failed", "模型暂时失败，下次筛选会重试")
+                    self._log(f"筛选暂时失败 {job.get('title')}：{exc}。本轮先跳过，下次再试")
                     continue
             else:
                 result = {
@@ -479,7 +582,6 @@ class CollectController:
                     self._sent_urls.add(url)
                 if outcome == "submitted":
                     applied += 1
-                    self._bump("applied")
                 self._set(progress=f"{applied}/{target}")
                 self._log(f"{'已投递' if outcome == 'submitted' else '已经投过'} {job.get('title')}：{detail}")
                 continue
@@ -503,9 +605,6 @@ class CollectController:
             self._card_cursor = 0
             self._list_head = head
 
-        def on_stats(_stats: dict) -> None:
-            self._set(collected=self.db.count_jobs())
-
         stats = collect_jobs(
             browser.page,
             browser.context,
@@ -514,13 +613,12 @@ class CollectController:
             self.stop_event,
             self.pause_event,
             on_log=self._log,
-            on_stats=on_stats,
+            on_stats=None,
             fetch_detail=False,
             fresh=False,
             start_index=self._card_cursor,
         )
         self._mark_already_sent()
-        self._set(collected=self.db.count_jobs())
         self._remember_page(browser)
         if stats.get("stopped") or self.stop_event.is_set():
             raise CollectionStopped()
@@ -537,7 +635,8 @@ class CollectController:
             self._log("浏览器窗口已关闭，请重新启动")
             return
         target = max(1, min(int(target), 200))
-        self._set(task="筛选投递中", progress=f"0/{target}", applied=0, screened=0)
+        self._model_give_up.clear()
+        self._set(task="筛选投递中", progress=f"0/{target}", screened=0)
         self._capture_sent()
         profile = load_profile()
         resume_text = self.db.resume_text()
@@ -564,7 +663,7 @@ class CollectController:
                     continue
                 self._set(task="空闲", progress=f"{applied}/{target}")
                 self._log(
-                    f"这一页已经没有新岗位，停止投递，本批投出 {applied}/{target}。"
+                    f"这一页已经没有新岗位，停止投递，本轮投出 {applied}/{target}。"
                     "浏览器保持打开，请自己修改条件并刷出新岗位，再点「筛选并投递」。"
                 )
                 return
@@ -574,11 +673,11 @@ class CollectController:
             return
         except CollectionStopped:
             self._set(task="已停止", progress=f"{applied}/{target}")
-            self._log(f"已停止，本批投出 {applied}/{target}")
+            self._log(f"已停止，本轮投出 {applied}/{target}")
             return
         self._set(task="空闲", progress=f"{applied}/{target}")
         if applied >= target:
-            self._log(f"本批已投出 {applied} 个，达到设定数量")
+            self._log(f"本轮已投出 {applied} 个，达到设定数量")
         else:
             self._log(f"续投结束，实际投出 {applied}/{target}")
 
@@ -589,7 +688,8 @@ class CollectController:
         self._card_cursor = 0
         self._collect_interrupted = False
         self.db.clear_job_list()
-        self._set(collected=0, duplicated=0, failed=0, screened=0, applied=0, progress="0/0", task="空闲")
+        self._note_list_cleared()
+        self._set(duplicated=0, failed=0, screened=0, progress="0/0", task="空闲")
         self._log("已清空当前职位，不会自动采集")
 
     def _crawl_current_page(self, browser: BrowserSession) -> None:
@@ -612,14 +712,14 @@ class CollectController:
         self._set(login=status)
         if status != "已登录":
             self._set(task="等待用户")
-            self._log("请先登录，登录后再点「开始采集」。")
+            self._log("请先登录，登录后再点「仅采集」。")
             return
         resume = self._collect_interrupted and self.db.count_jobs() > 0
         if resume:
             self._log("从上次停下的位置继续采集，已入库岗位会跳过")
             self._auto_collect(browser, replace=False)
         else:
-            self._log("开始采集当前页面职位")
+            self._log("正在仅采集当前页面职位")
             self._auto_collect(browser, replace=True)
 
     def _collect(self, browser: BrowserSession, max_count: int, batch: bool = False, refresh: bool = False) -> None:
@@ -631,10 +731,11 @@ class CollectController:
         try:
             if refresh:
                 status = browser.refresh_job_list(self._entry_url())
-                self._log("推荐页已刷新，开始采集这一批新职位")
+                self._log("推荐页已刷新，正在采集这一批新职位")
                 if status != "已登录":
                     raise ManualActionRequired(status)
                 self.db.clear_job_list()
+                self._note_list_cleared()
                 self._log("已清空旧职位列表，只保留这次刷新出来的职位")
             else:
                 status = browser.ensure_collection_allowed(self._entry_url())
@@ -650,7 +751,6 @@ class CollectController:
         def on_stats(stats: dict) -> None:
             done = stats["handled"] if batch else stats["collected"]
             self._set(
-                collected=stats["collected"],
                 duplicated=stats["duplicated"],
                 failed=stats["failed"],
                 progress=f"{done}/{max_count}",
@@ -711,26 +811,33 @@ class CollectController:
     def start_browser(self) -> str:
         with self._lock:
             if self._busy:
-                return "已有任务在执行，不能同时启动浏览器"
+                self._notice = "已有任务在执行，不能同时启动浏览器"
+                return self._notice
             self._busy = True
             self.stop_event.clear()
+            self._stopping = False
             self.snapshot["task"] = "启动浏览器"
+            self._notice = self._busy_text()
         self._ensure_thread()
         self._queue.put(("start_browser",))
-        return "正在启动浏览器"
+        return self.status_text()
 
     def reload_browser(self) -> str:
         with self._lock:
             if self.snapshot["browser"] != "已启动":
-                return "请先启动浏览器"
+                self._notice = "请先启动浏览器"
+                return self._notice
             if self._busy:
-                return "任务进行中，请先停止再重新加载"
+                self._notice = "任务进行中，请先停止再重新加载"
+                return self._notice
             self._busy = True
             self.stop_event.clear()
+            self._stopping = False
             self.snapshot["task"] = "重新加载"
+            self._notice = self._busy_text()
         self._ensure_thread()
         self._queue.put(("reload_page",))
-        return "正在点击浏览器重新加载"
+        return self.status_text()
 
     def _reload_page(self, browser: BrowserSession) -> None:
         if not browser.is_alive():
@@ -778,130 +885,161 @@ class CollectController:
             count = max(1, min(300, count))
             with self._lock:
                 if self.snapshot["browser"] != "已启动":
-                    return "请先启动浏览器，并在窗口中完成登录"
+                    self._notice = "请先启动浏览器，并在窗口中完成登录"
+                    return self._notice
                 if self._busy:
-                    return "已有采集或分析任务在运行"
+                    self._notice = "已有采集或分析任务在运行"
+                    return self._notice
                 self._busy = True
                 self.stop_event.clear()
                 self.pause_event.clear()
+                self._stopping = False
                 self._active_task = "采集中"
                 self.snapshot.update(
-                    {"task": "采集中", "progress": f"0/{count}", "collected": 0, "duplicated": 0, "failed": 0}
+                    {"task": "采集中", "progress": f"0/{count}", "duplicated": 0, "failed": 0}
                 )
+                self._keep_totals()
+                self._notice = self._busy_text()
             self._ensure_thread()
             self._queue.put(("collect", count))
-            return "已开始采集"
+            return self.status_text()
         return self.start_crawl()
 
     def crawl_button_label(self) -> str:
         with self._lock:
             task = self.snapshot["task"]
-        if task in {"采集中", "已暂停"}:
+            active = self._active_task
+        if task == "采集中" or (task == "已暂停" and active == "采集中"):
             return "停止采集"
-        return "开始采集"
+        return "仅采集"
+
+    def apply_button_label(self) -> str:
+        with self._lock:
+            task = self.snapshot["task"]
+            active = self._active_task
+        if task == "筛选投递中" or (task == "已暂停" and active == "筛选投递中"):
+            return "停止投递"
+        return "筛选并投递"
 
     def toggle_crawl(self) -> str:
         with self._lock:
             task = self.snapshot["task"]
-        if task in {"采集中", "已暂停"}:
+            active = self._active_task
+        if task == "采集中" or (task == "已暂停" and active == "采集中"):
             return self.stop()
         return self.start_crawl()
 
     def start_crawl(self) -> str:
         with self._lock:
             if self.snapshot["browser"] != "已启动":
-                return "请先启动浏览器，并在窗口中完成登录"
+                self._notice = "请先启动浏览器，并在窗口中完成登录"
+                return self._notice
             if self._busy:
-                return "已有采集或分析任务在运行"
+                self._notice = "已有采集或分析任务在运行"
+                return self._notice
             resume = self._collect_interrupted and self.db.count_jobs() > 0
             self._busy = True
             self.stop_event.clear()
             self.pause_event.clear()
+            self._stopping = False
             self._active_task = "采集中"
             self.snapshot.update(
                 {
                     "task": "采集中",
-                    "progress": "采集中",
+                    "progress": "继续采集" if resume else "仅采集中",
                     "duplicated": 0,
                     "failed": 0,
                     "screened": 0,
-                    "applied": 0,
                 }
             )
-            if not resume:
-                self.snapshot["collected"] = 0
+            self._keep_totals()
+            if resume:
+                self._notice = "正在从上次停下的位置继续仅采集。"
+            else:
+                self._notice = "正在仅采集当前页。点「停止采集」会等当前这条处理完再停。"
         self._ensure_thread()
         self._queue.put(("crawl",))
-        if resume:
-            return "继续采集：从上次停下的位置接着往下刷"
-        return "开始采集当前页。点停止采集可暂存进度，再点开始会继续。"
+        return self.status_text()
 
     def start_batch(self, count: int) -> str:
         count = max(1, min(int(count), 300))
         with self._lock:
             if self.snapshot["browser"] != "已启动":
-                return "请先启动浏览器，并在窗口中完成登录"
+                self._notice = "请先启动浏览器，并在窗口中完成登录"
+                return self._notice
             if self._busy:
-                return "已有采集或分析任务在运行"
+                self._notice = "已有采集或分析任务在运行"
+                return self._notice
             self._busy = True
             self.stop_event.clear()
             self.pause_event.clear()
+            self._stopping = False
             self._active_task = "筛选投递中"
             self.snapshot.update(
                 {
                     "task": "筛选投递中",
                     "progress": f"0/{count}",
-                    "collected": 0,
                     "duplicated": 0,
                     "failed": 0,
                     "screened": 0,
-                    "applied": 0,
                 }
             )
+            self._keep_totals()
+            self._notice = self._busy_text()
         self._ensure_thread()
         self._queue.put(("batch", count))
-        return "已开始批量筛选并投递。通过筛选的职位会点击立即投递，页面确认后才记为已投递。"
+        return self.status_text()
 
     def start_apply(self, count) -> str:
         try:
             target = int(count)
         except (TypeError, ValueError):
-            return "投递数量无效"
+            self._notice = "投递数量无效"
+            return self._notice
         target = max(1, min(target, 200))
         with self._lock:
             if self.snapshot["browser"] != "已启动":
-                return "请先启动浏览器，并在窗口中完成登录"
+                self._notice = "请先启动浏览器，并在窗口中完成登录"
+                return self._notice
             if self._busy:
-                return "采集还在进行，请等这一页采完"
+                self._notice = "采集还在进行，请等这一页采完"
+                return self._notice
             self._busy = True
             self.stop_event.clear()
             self.pause_event.clear()
+            self._stopping = False
             self._active_task = "筛选投递中"
             self.snapshot.update(
                 {
                     "task": "筛选投递中",
                     "progress": f"0/{target}",
                     "screened": 0,
-                    "applied": 0,
                 }
             )
+            self._keep_totals()
+            self._notice = f"正在筛选并投递，本轮进度 0/{target}。已投递按这次启动后的累计计算，不会清零。"
         self._ensure_thread()
         self._queue.put(("apply", target))
-        return f"开始筛选并投递，投出 {target} 个或当前页没有新岗位就停止。浏览器会保持打开。"
+        return self.status_text()
 
     def clear_jobs(self) -> str:
         with self._lock:
             if self._busy:
-                return "请先停止当前任务"
+                self._notice = "请先停止当前任务"
+                return self._notice
             thread_alive = self._thread is not None and self._thread.is_alive()
             if thread_alive:
                 self._busy = True
         if not thread_alive:
             self._clear_jobs_only()
-            return "已清空当前职位。需要时再点「开始采集」或「筛选并投递」。"
+            with self._lock:
+                self._notice = "已清空当前职位。已采集和已投递仍是这次启动后的累计。需要时再点「仅采集」或「筛选并投递」。"
+            return self._notice
         self._ensure_thread()
         self._queue.put(("clear_jobs",))
-        return "正在清空列表（不会自动采集）"
+        with self._lock:
+            self._notice = "正在清空列表，不会自动采集。已采集和已投递数字保持不变。"
+        return self._notice
 
     def start_refresh_batch(self, count: int) -> str:
         count = max(1, min(int(count), 300))
@@ -918,13 +1056,13 @@ class CollectController:
                 {
                     "task": "筛选投递中",
                     "progress": f"0/{count}",
-                    "collected": 0,
                     "duplicated": 0,
                     "failed": 0,
                     "screened": 0,
-                    "applied": 0,
                 }
             )
+            self._keep_totals()
+            self._notice = self._busy_text()
         self._ensure_thread()
         self._queue.put(("refresh_batch", count))
         return "正在刷新推荐页。新出现的职位会重新采集，技能、职责和要求会重新交给 AI。已经投递过的不会再投。"
@@ -933,36 +1071,52 @@ class CollectController:
         with self._lock:
             task = self.snapshot["task"]
             if task not in {"采集中", "已暂停", "筛选投递中"}:
-                return "当前没有进行中的采集"
+                self._notice = "当前没有进行中的任务"
+                return self._notice
             if self.pause_event.is_set():
                 self.pause_event.clear()
                 self.snapshot["task"] = self._active_task
-                return "已继续"
+                self._notice = self._busy_text()
+                return self._notice
             self.pause_event.set()
             self.snapshot["task"] = "已暂停"
-            return "已暂停"
+            self._notice = self._busy_text()
+            return self._notice
 
     def stop(self) -> str:
         with self._lock:
             task = self.snapshot["task"]
+            active = self._active_task
             if task not in {"采集中", "已暂停", "分析中", "启动浏览器", "筛选投递中"}:
-                return "当前没有需要停止的任务"
+                self._notice = "当前没有需要停止的任务"
+                return self._notice
+            self._stopping = True
+            if task == "筛选投递中" or active == "筛选投递中":
+                text = "正在停止筛选并投递，等当前岗位处理完再停。"
+            elif task == "采集中" or active == "采集中":
+                text = "正在停止仅采集，等当前岗位处理完再停。"
+            else:
+                text = "正在停止当前任务，等它处理完。"
+            self._notice = text
         self.stop_event.set()
         self.pause_event.clear()
-        self._log("正在停止")
-        return "正在停止"
+        self._log(text)
+        return text
 
     def close_browser(self) -> str:
         with self._lock:
             if self.snapshot["browser"] != "已启动" and not self._busy:
-                return "浏览器未启动"
+                self._notice = "浏览器未启动"
+                return self._notice
             if self._busy and self.snapshot["task"] in {"采集中", "已暂停", "分析中", "筛选投递中"}:
-                return "请先停止当前任务"
+                self._notice = "请先停止当前任务"
+                return self._notice
             self._busy = True
+            self._notice = "正在关闭浏览器。"
         self.stop_event.set()
         self._ensure_thread()
         self._queue.put(("close_browser",))
-        return "正在关闭浏览器"
+        return "正在关闭浏览器。"
 
     def start_analysis(self) -> str:
         with self._lock:
@@ -1119,17 +1273,29 @@ class CollectController:
 
     def view(self) -> dict:
         with self._lock:
-            data = dict(self.snapshot)
             logs = "\n".join(self.logs)
         try:
             jobs = self.db.job_rows()
             applications = self.db.application_rows()
             filename = self.db.resume_filename()
             resume_length = len(self.db.resume_text())
-            data["collected"] = len(jobs)
+            job_count = len(jobs)
+            submitted = self._submitted_count()
         except Exception:
             logger.error("读取数据库失败")
             jobs, applications, filename, resume_length = [], [], "", 0
+            job_count = 0
+            submitted = 0
+        with self._lock:
+            if job_count > self._seen_jobs:
+                self._session_collected += job_count - self._seen_jobs
+            self._seen_jobs = job_count
+            if submitted > self._seen_applied:
+                self._session_applied += submitted - self._seen_applied
+            self._seen_applied = submitted
+            self.snapshot["collected"] = self._session_collected
+            self.snapshot["applied"] = self._session_applied
+            data = dict(self.snapshot)
         resume = f"已上传 {filename}，正文 {resume_length} 字" if filename else "尚未上传简历"
         data.update({"logs": logs, "jobs": jobs, "applications": applications, "resume": resume})
         return data
