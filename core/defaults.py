@@ -13,6 +13,16 @@ HR_ACTIVITY_CHOICES = (
 
 JOB_TYPE_CHOICES = ("实习", "正式", "校招", "社招")
 
+DEFAULT_MODEL: dict = {
+    "host": "http://127.0.0.1:11434",
+    "name": "qwen3.5:9b",
+    "temperature": 0.1,
+    "num_predict": 480,
+    "timeout_seconds": 140,
+    "disable_think": True,
+    "keep_alive": "30m",
+}
+
 DEFAULT_PROFILE: dict = {
     "target_url": "https://www.zhaopin.com/jobs/?pageMode=recommend",
     "auto_apply": True,
@@ -139,4 +149,5 @@ DEFAULT_PROFILE: dict = {
         "reject_experience_at_least_years": 3,
         "reject_salary_max_below_min": True,
     },
+    "model": dict(DEFAULT_MODEL),
 }

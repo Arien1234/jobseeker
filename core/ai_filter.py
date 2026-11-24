@@ -12,6 +12,7 @@ import time
 import urllib.error
 import urllib.request
 
+from core.defaults import DEFAULT_MODEL
 from core.job_parser import clean_inline
 from core.logging_config import get_logger
 from core.models import RECOMMENDATIONS, recommendation_for_score
@@ -401,22 +402,151 @@ def _run_interruptible(worker, stop_event, timeout: int):
     return box.get("value")
 
 
-def _post_chat(user_message: str, *, include_think: bool, num_predict: int, timeout: int, stop_event=None) -> str:
+def resolve_model_settings(profile: dict | None = None) -> dict:
+    """Saved model settings win. Missing fields fall back to the built-in default, then environment."""
+    saved = {}
+    if isinstance(profile, dict) and isinstance(profile.get("model"), dict):
+        saved = profile["model"]
+    merged = dict(DEFAULT_MODEL)
+    if not str(saved.get("host") or "").strip():
+        merged["host"] = OLLAMA_URL
+    if not str(saved.get("name") or "").strip():
+        merged["name"] = MODEL
+    for key, value in saved.items():
+        if key in merged and value is not None and value != "":
+            merged[key] = value
+    return normalize_model_settings(
+        merged["host"],
+        merged["name"],
+        merged["temperature"],
+        merged["num_predict"],
+        merged["timeout_seconds"],
+        merged["disable_think"],
+        merged["keep_alive"],
+    )
+
+
+def normalize_model_settings(host, name, temperature, num_predict, timeout_seconds, disable_think, keep_alive) -> dict:
+    address = str(host or "").strip().rstrip("/")
+    if not address.startswith(("http://", "https://")):
+        raise ValueError("服务地址要以 http:// 或 https:// 开头")
+    model_name = str(name or "").strip()
+    if not model_name:
+        raise ValueError("请填写模型名称")
+    try:
+        heat = float(temperature)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("温度要是数字") from exc
+    if not 0 <= heat <= 2:
+        raise ValueError("温度要在 0 到 2 之间")
+    try:
+        predict = int(num_predict)
+        wait = int(timeout_seconds)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("生成长度和超时要是整数") from exc
+    if not 32 <= predict <= 4096:
+        raise ValueError("单次最多生成 token 要在 32 到 4096 之间")
+    if not 20 <= wait <= 600:
+        raise ValueError("等待超时要在 20 到 600 秒之间")
+    alive = str(keep_alive or "").strip() or "30m"
+    return {
+        "host": address,
+        "name": model_name,
+        "temperature": round(heat, 2),
+        "num_predict": predict,
+        "timeout_seconds": wait,
+        "disable_think": bool(disable_think),
+        "keep_alive": alive,
+    }
+
+
+def list_model_names(host: str) -> list[str]:
+    address = str(host or "").strip().rstrip("/")
+    request = urllib.request.Request(f"{address}/api/tags")
+    with urllib.request.urlopen(request, timeout=8) as response:
+        data = json.loads(response.read().decode("utf-8"))
+    names = []
+    for item in data.get("models") or []:
+        model_name = str(item.get("name") or item.get("model") or "").strip()
+        if model_name and model_name not in names:
+            names.append(model_name)
+    return names
+
+
+def probe_model(settings: dict) -> str:
+    """Ask the configured model for a tiny JSON reply."""
     payload = {
-        "model": MODEL,
+        "model": settings["name"],
+        "stream": False,
+        "format": "json",
+        "messages": [
+            {"role": "system", "content": "只输出 JSON：{\"ok\": true}"},
+            {"role": "user", "content": "回复 ok"},
+        ],
+        "options": {"temperature": 0, "num_predict": 32},
+        "keep_alive": settings["keep_alive"],
+    }
+    if settings.get("disable_think"):
+        payload["think"] = False
+    request = urllib.request.Request(
+        f"{settings['host']}/api/chat",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    wait = min(int(settings["timeout_seconds"]), 90)
+    try:
+        with urllib.request.urlopen(request, timeout=wait) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if settings.get("disable_think") and exc.code == 400:
+            payload.pop("think", None)
+            request = urllib.request.Request(
+                f"{settings['host']}/api/chat",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=wait) as response:
+                    body = json.loads(response.read().decode("utf-8"))
+            except Exception as exc:
+                return f"连不上 {settings['host']} 的 {settings['name']}：{type(exc).__name__}"
+        else:
+            return f"连不上 {settings['name']}：HTTP {exc.code}"
+    except Exception as exc:
+        return f"连不上 {settings['host']} 的 {settings['name']}：{type(exc).__name__}"
+    content = str(((body.get("message") or {}).get("content") or "")).strip()
+    if not content:
+        return f"{settings['name']} 没有返回内容"
+    return f"已连上 {settings['name']}。保存后，之后的筛选会用这个模型。"
+
+
+def _post_chat(
+    user_message: str,
+    *,
+    settings: dict,
+    include_think: bool,
+    stop_event=None,
+) -> str:
+    payload = {
+        "model": settings["name"],
         "stream": False,
         "format": "json",
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_message},
         ],
-        "options": {"temperature": 0.1, "num_predict": num_predict},
-        "keep_alive": "30m",
+        "options": {
+            "temperature": settings["temperature"],
+            "num_predict": settings["num_predict"],
+        },
+        "keep_alive": settings["keep_alive"],
     }
-    if include_think:
+    if include_think and settings.get("disable_think"):
         payload["think"] = False
     request = urllib.request.Request(
-        f"{OLLAMA_URL}/api/chat",
+        f"{settings['host']}/api/chat",
         data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"},
         method="POST",
@@ -424,10 +554,10 @@ def _post_chat(user_message: str, *, include_think: bool, num_predict: int, time
 
     def worker(box: dict) -> str:
         opener = urllib.request.build_opener(_CaptureHandler(box))
-        with opener.open(request, timeout=timeout) as response:
+        with opener.open(request, timeout=settings["timeout_seconds"]) as response:
             return response.read().decode("utf-8")
 
-    raw = _run_interruptible(worker, stop_event, timeout)
+    raw = _run_interruptible(worker, stop_event, settings["timeout_seconds"])
     try:
         data = json.loads(raw)
         content = data["message"]["content"]
@@ -447,8 +577,11 @@ def _pause_for_retry(seconds: float, stop_event) -> None:
         time.sleep(0.2)
 
 
-def call_ollama(user_message: str, timeout: int = 140, stop_event=None) -> str:
+def call_ollama(user_message: str, timeout: int = 140, stop_event=None, settings: dict | None = None) -> str:
     """Ask the local model. HTTP 500 and empty replies are retried; stop returns immediately."""
+    active = dict(settings or resolve_model_settings(None))
+    if settings is None:
+        active["timeout_seconds"] = timeout
     last_error: Exception | None = None
     allow_think_flag = True
     for attempt in range(3):
@@ -456,13 +589,11 @@ def call_ollama(user_message: str, timeout: int = 140, stop_event=None) -> str:
             raise AIInterrupted("已停止，模型这次不等了")
         if attempt:
             _pause_for_retry(2 * attempt, stop_event)
-        num_predict = 480
         try:
             return _post_chat(
                 user_message,
+                settings=active,
                 include_think=allow_think_flag,
-                num_predict=num_predict,
-                timeout=timeout,
                 stop_event=stop_event,
             )
         except AIInterrupted:
@@ -474,9 +605,8 @@ def call_ollama(user_message: str, timeout: int = 140, stop_event=None) -> str:
                 try:
                     return _post_chat(
                         user_message,
+                        settings=active,
                         include_think=False,
-                        num_predict=num_predict,
-                        timeout=timeout,
                         stop_event=stop_event,
                     )
                 except AIInterrupted:
@@ -519,10 +649,11 @@ def analyze_job(job: dict, profile: dict, resume_text: str, api_key: str | None 
         return rejected
     decision = evaluate_rules(job, profile)
     message = build_user_message(job, profile, resume_text)
+    settings = resolve_model_settings(profile)
     content = ""
     payload = None
     for attempt in range(2):
-        content = call_ollama(message, stop_event=stop_event)
+        content = call_ollama(message, stop_event=stop_event, settings=settings)
         try:
             payload = parse_ai_payload(content)
             break
@@ -535,7 +666,7 @@ def analyze_job(job: dict, profile: dict, resume_text: str, api_key: str | None 
     if payload is None:
         raise AIJsonError("模型没有返回完整 JSON")
     result = apply_policy(payload, job, profile, decision.unknown_fields)
-    result["source"] = MODEL
+    result["source"] = settings["name"]
     stored = dict(result)
     result["raw_json"] = json.dumps(stored, ensure_ascii=False)
     return result

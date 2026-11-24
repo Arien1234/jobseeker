@@ -8,7 +8,8 @@ import json
 
 import gradio as gr
 
-from core.defaults import DEFAULT_PROFILE, HR_ACTIVITY_CHOICES, JOB_TYPE_CHOICES
+from core.ai_filter import list_model_names, normalize_model_settings, probe_model, resolve_model_settings
+from core.defaults import DEFAULT_MODEL, DEFAULT_PROFILE, HR_ACTIVITY_CHOICES, JOB_TYPE_CHOICES
 from core.logging_config import setup_logging
 from core.profile_store import load_profile
 from core.task_manager import CollectController
@@ -79,7 +80,7 @@ body, gradio-app, .gradio-container, .gradio-container .main,
   background-color: var(--body-background-fill, #0b0f19) !important;
   border-bottom: 1px solid var(--border-color-primary, #243044);
 }
-#job-toolbar, #filter-panel {
+#job-toolbar, #filter-panel, #model-panel {
   display: flex;
   flex-direction: column;
   gap: 16px;
@@ -87,14 +88,14 @@ body, gradio-app, .gradio-container, .gradio-container .main,
   position: relative;
   z-index: 1;
 }
-#job-toolbar label, #filter-panel label, #job-table label {
+#job-toolbar label, #filter-panel label, #model-panel label, #job-table label {
   position: static !important;
   display: block !important;
   transform: none !important;
   inset: auto !important;
   margin: 0 0 6px !important;
 }
-#job-toolbar .row, #filter-panel .row, .status-row {
+#job-toolbar .row, #filter-panel .row, #model-panel .row, .status-row {
   flex-wrap: wrap !important;
   gap: 10px !important;
 }
@@ -102,7 +103,7 @@ body, gradio-app, .gradio-container, .gradio-container .main,
   flex-wrap: nowrap !important;
   gap: 10px !important;
 }
-.browser-actions > *, .work-actions > *, .status-row > *, #filter-panel .row > *, #job-toolbar .row > * {
+.browser-actions > *, .work-actions > *, .status-row > *, #filter-panel .row > *, #model-panel .row > *, #job-toolbar .row > * {
   flex: 1 1 0 !important;
   min-width: 0 !important;
 }
@@ -111,7 +112,7 @@ body, gradio-app, .gradio-container, .gradio-container .main,
   width: 100%;
   white-space: nowrap !important;
 }
-#job-toolbar textarea, #filter-panel textarea { min-height: 42px !important; }
+#job-toolbar textarea, #filter-panel textarea, #model-panel textarea { min-height: 42px !important; }
 #job-table {
   width: 100% !important;
   margin-top: 8px;
@@ -286,7 +287,7 @@ mark.job-hit {
   to { opacity: 0; transform: translateY(8px) scale(0.985); }
 }
 #job-dialog .prose { max-width: none !important; }
-#filter-panel { padding-bottom: 64px; }
+#filter-panel, #model-panel { padding-bottom: 64px; }
 #resume-card {
   margin-top: 12px;
   padding: 18px 18px 16px;
@@ -603,6 +604,54 @@ def open_from_pick(raw: str):
     return detail, gr.update(visible=True)
 
 
+def _refresh_models(host, current):
+    try:
+        names = list_model_names(host)
+    except Exception as exc:
+        return gr.update(), f"读不到本机模型：{type(exc).__name__}"
+    if not names:
+        return gr.update(), "这个地址上没有已安装的模型。"
+    chosen = str(current or "").strip()
+    if chosen and chosen not in names:
+        names = [chosen, *names]
+    value = chosen if chosen in names else names[0]
+    return gr.update(choices=names, value=value), f"读到 {len(names)} 个模型。"
+
+
+def _test_model(host, name, temperature, num_predict, timeout_seconds, keep_alive, disable_think):
+    try:
+        settings = normalize_model_settings(
+            host, name, temperature, num_predict, timeout_seconds, disable_think, keep_alive
+        )
+    except ValueError as exc:
+        return str(exc)
+    return probe_model(settings)
+
+
+def _save_model(host, name, temperature, num_predict, timeout_seconds, keep_alive, disable_think):
+    try:
+        return controller.save_model_settings(
+            host, name, temperature, num_predict, timeout_seconds, disable_think, keep_alive
+        )
+    except ValueError as exc:
+        return str(exc)
+
+
+def _restore_model():
+    profile = controller.restore_default_model()
+    settings = resolve_model_settings(profile)
+    return (
+        f"已恢复默认模型 {DEFAULT_MODEL['name']}。",
+        settings["host"],
+        gr.update(choices=[settings["name"]], value=settings["name"]),
+        settings["temperature"],
+        settings["num_predict"],
+        settings["timeout_seconds"],
+        settings["keep_alive"],
+        settings["disable_think"],
+    )
+
+
 def build_app() -> gr.Blocks:
     profile = load_profile()
     initial_jobs = _jobs_html(controller.view().get("jobs") or [])
@@ -767,6 +816,62 @@ def build_app() -> gr.Blocks:
                         with gr.Row(elem_id="resume-actions"):
                             resume_button = gr.Button("解析并保存", variant="primary")
                             clear_resume = gr.Button("删除简历")
+
+            with gr.Tab("模型配置"):
+                model_settings = resolve_model_settings(profile)
+                with gr.Column(elem_id="model-panel"):
+                    gr.Markdown(
+                        "默认是本机 Ollama 的 `qwen3.5:9b`。"
+                        "换地址或换模型后先测试，再保存。保存之前的筛选仍用当前已保存的模型。"
+                    )
+                    with gr.Row():
+                        model_host = gr.Textbox(
+                            label="服务地址",
+                            value=model_settings["host"],
+                        )
+                        model_name = gr.Dropdown(
+                            label="模型名称",
+                            choices=[model_settings["name"]],
+                            value=model_settings["name"],
+                            allow_custom_value=True,
+                        )
+                    with gr.Row():
+                        model_temperature = gr.Slider(
+                            label="温度",
+                            minimum=0,
+                            maximum=2,
+                            step=0.05,
+                            value=model_settings["temperature"],
+                        )
+                        model_predict = gr.Slider(
+                            label="单次最多生成 token",
+                            minimum=32,
+                            maximum=4096,
+                            step=32,
+                            value=model_settings["num_predict"],
+                        )
+                        model_timeout = gr.Slider(
+                            label="等待超时（秒）",
+                            minimum=20,
+                            maximum=600,
+                            step=10,
+                            value=model_settings["timeout_seconds"],
+                        )
+                    with gr.Row():
+                        model_keep_alive = gr.Textbox(
+                            label="模型驻留时间",
+                            value=model_settings["keep_alive"],
+                        )
+                        model_disable_think = gr.Checkbox(
+                            label="关闭思考过程",
+                            value=bool(model_settings["disable_think"]),
+                        )
+                    with gr.Row():
+                        refresh_models = gr.Button("读取本机模型")
+                        test_model = gr.Button("测试连接")
+                        save_model = gr.Button("保存模型", variant="primary")
+                        restore_model = gr.Button("恢复默认模型")
+                    model_message = gr.Textbox(label="模型状态", interactive=False, lines=2)
 
         outputs = [
             login_box,
@@ -1073,6 +1178,31 @@ def build_app() -> gr.Blocks:
             outputs=filter_message,
         )
         clear_resume.click(controller.clear_resume_data, outputs=filter_message)
+        model_inputs = [
+            model_host,
+            model_name,
+            model_temperature,
+            model_predict,
+            model_timeout,
+            model_keep_alive,
+            model_disable_think,
+        ]
+        refresh_models.click(_refresh_models, inputs=[model_host, model_name], outputs=[model_name, model_message])
+        test_model.click(_test_model, inputs=model_inputs, outputs=model_message)
+        save_model.click(_save_model, inputs=model_inputs, outputs=model_message)
+        restore_model.click(
+            _restore_model,
+            outputs=[
+                model_message,
+                model_host,
+                model_name,
+                model_temperature,
+                model_predict,
+                model_timeout,
+                model_keep_alive,
+                model_disable_think,
+            ],
+        )
     return demo
 
 

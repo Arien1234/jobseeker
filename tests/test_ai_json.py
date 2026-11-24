@@ -258,3 +258,29 @@ def test_stop_does_not_wait_for_a_hung_model():
     with pytest.raises(AIInterrupted):
         _run_interruptible(hang, stop, 30)
     assert time.perf_counter() - started < 1.5
+
+
+def test_saved_model_wins_over_defaults():
+    from core.ai_filter import MODEL, OLLAMA_URL, normalize_model_settings, resolve_model_settings
+
+    saved = resolve_model_settings(
+        {
+            "model": {
+                "host": "http://10.0.0.8:11434",
+                "name": "qwen2.5:7b",
+                "temperature": 0.4,
+            }
+        }
+    )
+    assert saved["host"] == "http://10.0.0.8:11434"
+    assert saved["name"] == "qwen2.5:7b"
+    assert saved["temperature"] == 0.4
+    assert saved["num_predict"] == 480
+    assert saved["disable_think"] is True
+
+    fallback = resolve_model_settings({})
+    assert fallback["name"] == MODEL
+    assert fallback["host"] == OLLAMA_URL
+
+    with pytest.raises(ValueError):
+        normalize_model_settings("localhost:11434", "qwen3.5:9b", 0.1, 480, 140, True, "30m")

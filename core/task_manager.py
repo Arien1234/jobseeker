@@ -1284,11 +1284,41 @@ class CollectController:
 
         current = load_profile()
         profile = deepcopy(DEFAULT_PROFILE)
-        for key in ("education", "skills", "projects", "project_policy"):
+        for key in ("education", "skills", "projects", "project_policy", "model"):
             if key in current:
                 profile[key] = current[key]
         save_profile(profile)
         self._log("已恢复默认筛选条件")
+        return profile
+
+    def save_model_settings(
+        self,
+        host,
+        name,
+        temperature,
+        num_predict,
+        timeout_seconds,
+        disable_think,
+        keep_alive,
+    ) -> str:
+        from core.ai_filter import normalize_model_settings
+
+        settings = normalize_model_settings(
+            host, name, temperature, num_predict, timeout_seconds, disable_think, keep_alive
+        )
+        profile = load_profile()
+        profile["model"] = settings
+        save_profile(profile)
+        self._log(f"模型已保存：{settings['name']}")
+        return f"已保存。之后的筛选使用 {settings['name']}。"
+
+    def restore_default_model(self) -> dict:
+        from core.defaults import DEFAULT_MODEL
+
+        profile = load_profile()
+        profile["model"] = dict(DEFAULT_MODEL)
+        save_profile(profile)
+        self._log("已恢复默认模型 qwen3.5:9b")
         return profile
 
     def view(self) -> dict:

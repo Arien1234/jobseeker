@@ -123,5 +123,14 @@
     "reject_degrees": ["硕士", "博士", "研究生", "MBA", "EMBA"],
     "reject_experience_at_least_years": 3,
     "reject_salary_max_below_min": true
+  },
+  "model": {
+    "host": "http://127.0.0.1:11434",
+    "name": "qwen3.5:9b",
+    "temperature": 0.1,
+    "num_predict": 480,
+    "timeout_seconds": 140,
+    "disable_think": true,
+    "keep_alive": "30m"
   }
 }
