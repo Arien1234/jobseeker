@@ -50,6 +50,7 @@ class CollectController:
         self._card_cursor = 0
         self._sent_urls: set[str] = set()
         self._model_give_up: set[int] = set()
+        self._model_watch = ""
         self._busy = False
         self._active_task = "采集中"
         self._stopping = False
@@ -111,6 +112,9 @@ class CollectController:
                 return f"正在停止仅采集，等当前岗位处理完。进度 {progress}。"
             return f"正在停止当前任务，等它处理完。进度 {progress}。"
         if task == "筛选投递中":
+            watching = getattr(self, "_model_watch", "")
+            if watching:
+                return f"正在让模型看「{watching}」。本机模型较慢，看完就继续下一个。进度 {progress}。"
             return f"正在筛选并投递，本轮进度 {progress}。"
         if task == "采集中":
             return f"正在仅采集，进度 {progress}。"
@@ -329,7 +333,7 @@ class CollectController:
             self.snapshot[key] = int(self.snapshot.get(key) or 0) + 1
 
     def _on_job(self, profile: dict, force_rescreen: bool = False):
-        from core.ai_filter import AIError, analyze_job, local_rejection
+        from core.ai_filter import AIError, AIInterrupted, analyze_job, local_rejection
         from core.application import should_auto_apply
         from core.auto_apply import apply_current_job
         from core.rules import evaluate_rules
@@ -343,7 +347,9 @@ class CollectController:
                 self._log(f"数据库保存失败: {job.get('title')}")
                 return
             stored = self.db.get_job(job_id) or job
-            decision = evaluate_rules(stored, profile)
+            screened = dict(profile)
+            screened["resume_text"] = resume_text
+            decision = evaluate_rules(stored, screened)
             needs_model = force_rescreen or stored.get("ai_score") is None or (
                 bool(stored.get("ai_hard_reject")) and not decision.hard_reject
             )
@@ -351,14 +357,20 @@ class CollectController:
                 result = local_rejection(stored, profile)
                 self.db.save_analysis(job_id, result)
             elif needs_model:
+                self._model_watch = str(job.get("title") or "")
                 try:
-                    result = analyze_job(stored, profile, resume_text)
+                    self._log(f"正在让模型看 {job.get('title')}")
+                    result = analyze_job(stored, profile, resume_text, stop_event=self.stop_event)
                     self.db.save_analysis(job_id, result)
+                except AIInterrupted:
+                    raise CollectionStopped()
                 except AIError as exc:
                     self._model_give_up.add(job_id)
                     self.db.record_application(job_id, "failed", "模型暂时失败，下次筛选会重试")
                     self._log(f"筛选暂时失败 {job.get('title')}：{exc}。本轮先跳过，下次再试")
                     return
+                finally:
+                    self._model_watch = ""
             else:
                 result = {
                     "score": int(stored["ai_score"]),
@@ -517,7 +529,7 @@ class CollectController:
             time.sleep(0.2)
 
     def _apply_jobs_once(self, browser: BrowserSession, profile: dict, resume_text: str, target: int, applied: int) -> int:
-        from core.ai_filter import AIError, analyze_job, local_rejection
+        from core.ai_filter import AIError, AIInterrupted, analyze_job, local_rejection
         from core.application import should_auto_apply
         from core.auto_apply import apply_current_job
         from core.collector import focus_job
@@ -537,19 +549,27 @@ class CollectController:
             if url and url in self._sent_urls:
                 self.db.record_application(int(job["id"]), "submitted", "本轮已经投递过")
                 continue
-            decision = evaluate_rules(job, profile)
+            screened = dict(profile)
+            screened["resume_text"] = resume_text
+            decision = evaluate_rules(job, screened)
             if decision.hard_reject:
-                result = local_rejection(job, profile)
+                result = local_rejection(job, screened)
                 self.db.save_analysis(job_id, result)
             elif job.get("ai_score") is None:
+                self._model_watch = str(job.get("title") or "")
                 try:
-                    result = analyze_job(job, profile, resume_text)
+                    self._log(f"正在让模型看 {job.get('title')}")
+                    result = analyze_job(job, profile, resume_text, stop_event=self.stop_event)
                     self.db.save_analysis(job_id, result)
+                except AIInterrupted:
+                    raise CollectionStopped()
                 except AIError as exc:
                     self._model_give_up.add(job_id)
                     self.db.record_application(job_id, "failed", "模型暂时失败，下次筛选会重试")
                     self._log(f"筛选暂时失败 {job.get('title')}：{exc}。本轮先跳过，下次再试")
                     continue
+                finally:
+                    self._model_watch = ""
             else:
                 result = {
                     "score": int(job["ai_score"]),

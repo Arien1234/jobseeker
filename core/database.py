@@ -426,7 +426,7 @@ class Database:
     def job_rows(self, limit: int | None = None) -> list[dict]:
         sql = """
                 SELECT j.id, j.title, j.company, j.salary, j.location, j.education, j.experience,
-                       j.company_size, j.hr_activity, j.prior_apply, j.ai_score, j.ai_recommendation, j.ai_summary,
+                       j.description, j.company_size, j.hr_activity, j.prior_apply, j.ai_score, j.ai_recommendation, j.ai_summary,
                        a.status AS application_status, a.reason AS application_reason
                 FROM jobs j
                 LEFT JOIN applications a ON a.job_id = j.id
@@ -464,6 +464,7 @@ class Database:
                     "序号": index,
                     "岗位详情": "查看",
                     "职位名称": row["title"],
+                    "详情正文": row["description"] or "",
                     "公司": row["company"],
                     "薪资": row["salary"],
                     "地点": row["location"],

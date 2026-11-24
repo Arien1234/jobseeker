@@ -202,6 +202,25 @@ body, gradio-app, .gradio-container, .gradio-container .main,
   outline: none;
   box-shadow: none;
 }
+.job-sheet tr.job-hidden { display: none; }
+.job-sheet td.job-title-cell {
+  min-width: 148px;
+  max-width: 240px;
+}
+mark.job-hit {
+  background: #ffd56a;
+  color: #1c1404;
+  border-radius: 3px;
+  padding: 0 2px;
+  font-weight: 700;
+}
+.job-hit-excerpt {
+  display: block;
+  margin-top: 4px;
+  color: #d5deea;
+  font-size: 12px;
+  line-height: 1.45;
+}
 #job-detail-pick {
   position: fixed !important;
   left: -10000px !important;
@@ -312,6 +331,61 @@ body, gradio-app, .gradio-container, .gradio-container .main,
   min-width: 0 !important;
   min-height: 44px !important;
 }
+#job-finder {
+  margin: 12px 0 4px !important;
+}
+#job-finder .form {
+  align-items: stretch !important;
+  flex-wrap: nowrap !important;
+}
+#job-keyword {
+  flex: 1 1 auto !important;
+  min-width: 0 !important;
+}
+#job-finder textarea {
+  min-height: 42px !important;
+}
+#applied-only {
+  flex: 0 0 auto !important;
+  width: auto !important;
+  min-width: 148px !important;
+  max-width: 168px !important;
+  align-self: stretch !important;
+  display: flex !important;
+  align-items: flex-end !important;
+}
+#applied-only > .wrap {
+  top: 0 !important;
+  bottom: 0 !important;
+  height: 100% !important;
+  min-height: 0 !important;
+  width: 100% !important;
+}
+#applied-only label {
+  display: flex !important;
+  align-items: center !important;
+  height: 42px !important;
+  min-height: 42px !important;
+  margin: 0 !important;
+  white-space: nowrap !important;
+  gap: 8px !important;
+}
+#applied-only input[type="checkbox"] {
+  width: 18px !important;
+  height: 18px !important;
+  min-width: 18px !important;
+  min-height: 18px !important;
+  max-height: 18px !important;
+  flex: 0 0 18px !important;
+  margin: 0 !important;
+}
+#applied-only .label-text {
+  white-space: nowrap !important;
+  width: auto !important;
+  line-height: 1.2 !important;
+}
+.job-type-note p { margin: 0 0 6px; }
+.job-type-note ul { margin: 4px 0 0; padding-left: 1.2em; }
 @media (max-width: 720px) {
   .browser-actions, .work-actions, .status-row { flex-wrap: wrap !important; }
   .browser-actions > *, .work-actions > *, .status-row > * { flex-basis: 100% !important; }
@@ -325,9 +399,12 @@ def _jobs_html(rows: list[dict]) -> str:
     body = []
     for row in rows:
         cells = []
+        title_text = str(row.get("职位名称") or "").replace("\n", " ")
+        detail_text = " ".join(str(row.get("详情正文") or "").split())
+        applied = "1" if "已投递" in str(row.get("投递状态") or "") else "0"
         for name in JOB_COLUMNS:
             if name == "岗位详情":
-                title = html.escape(str(row.get("职位名称") or "").replace("\n", " "), quote=True)
+                title = html.escape(title_text, quote=True)
                 company = html.escape(str(row.get("公司") or "").replace("\n", " "), quote=True)
                 try:
                     row_index = int(row.get("序号") or 1) - 1
@@ -339,9 +416,14 @@ def _jobs_html(rows: list[dict]) -> str:
                     f'data-title="{title}" data-company="{company}">查看</button>'
                     "</td>"
                 )
+            elif name == "职位名称":
+                cells.append(f'<td class="job-title-cell">{html.escape(title_text)}</td>')
             else:
                 cells.append(f"<td>{html.escape(str(row.get(name) if row.get(name) is not None else ''))}</td>")
-        body.append("<tr>" + "".join(cells) + "</tr>")
+        body.append(
+            f'<tr data-applied="{applied}" data-title="{html.escape(title_text, quote=True)}" '
+            f'data-detail="{html.escape(detail_text, quote=True)}">' + "".join(cells) + "</tr>"
+        )
     return (
         f'<div class="job-sheet-label">当前职位（{len(rows)}）</div>'
         '<div class="job-sheet-scroll"><table class="job-sheet">'
@@ -557,6 +639,20 @@ def build_app() -> gr.Blocks:
                     apply_count = gr.Slider(1, 200, value=150, step=1, label="本批投递数量")
                     log_box = gr.Textbox(label="实时日志", lines=6, interactive=False)
 
+                with gr.Row(elem_id="job-finder"):
+                    gr.Textbox(
+                        label="搜索职位",
+                        placeholder="只搜职位名称和岗位详情，匹配的词会标黄",
+                        elem_id="job-keyword",
+                        scale=4,
+                    )
+                    gr.Checkbox(
+                        label="只看已投递",
+                        elem_id="applied-only",
+                        scale=0,
+                        min_width=148,
+                    )
+
                 with gr.Column(visible=False, elem_id="job-modal") as job_dialog:
                     with gr.Column(elem_id="job-dialog"):
                         detail_box = gr.Markdown()
@@ -615,6 +711,16 @@ def build_app() -> gr.Blocks:
                         label="岗位类型（硬性，可全选）",
                         choices=list(JOB_TYPE_CHOICES),
                         value=profile.get("job_types") or list(JOB_TYPE_CHOICES),
+                    )
+                    gr.Markdown(
+                        "勾选校招或实习后，用简历里的大学毕业年份核对届别。"
+                        "岗位写明只招某一届、而简历不是这一届，就会排除。写了「优先」或「也可」的届别不算硬性限制。\n\n"
+                        "- **实习**：在校就能投，不需要毕业证。\n"
+                        "- **校招**：面向应届的某一届，毕业前的秋招、春招就可以投，入职一般在拿到毕业证之后。\n"
+                        "- **正式**：要有毕业证才能入职。还没毕业时，只有岗位写明可以发 offer、提前实习并提供转正，才考虑。\n"
+                        "- **社招**：面向已经毕业、正在社会上工作的人，同样需要毕业证。在读期间不投纯社招。\n\n"
+                        "筛选说明会写明这个岗位被判断成实习、校招、正式还是社招。",
+                        elem_classes=["job-type-note"],
                     )
                     with gr.Row():
                         filter_roles = gr.Textbox(
@@ -740,6 +846,11 @@ def build_app() -> gr.Blocks:
             void modal.offsetWidth;
             modal.style.animation = '';
             if (dialog) dialog.style.animation = '';
+            if (window.__highlightJobHits) {
+              window.__highlightJobHits();
+              setTimeout(window.__highlightJobHits, 80);
+              setTimeout(window.__highlightJobHits, 240);
+            }
             clearInterval(replay);
           } else if (tries > 40) {
             clearInterval(replay);
@@ -761,6 +872,159 @@ def build_app() -> gr.Blocks:
         if (button) button.click();
       }, 190);
     });
+  }
+  if (!window.__jobListFilter) {
+    window.__jobListFilter = true;
+    const escapeHtml = (value) => String(value || '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+    const marked = (text, keyword) => {
+      const source = String(text || '');
+      const query = String(keyword || '').trim();
+      if (!query) return escapeHtml(source);
+      const lower = source.toLowerCase();
+      const q = query.toLowerCase();
+      let htmlText = '';
+      let from = 0;
+      let at = lower.indexOf(q, from);
+      if (at < 0) return escapeHtml(source);
+      while (at >= 0) {
+        htmlText += escapeHtml(source.slice(from, at));
+        htmlText += '<mark class="job-hit">' + escapeHtml(source.slice(at, at + query.length)) + '</mark>';
+        from = at + query.length;
+        at = lower.indexOf(q, from);
+      }
+      return htmlText + escapeHtml(source.slice(from));
+    };
+    const excerpt = (text, keyword) => {
+      const source = String(text || '');
+      const q = keyword.toLowerCase();
+      const at = source.toLowerCase().indexOf(q);
+      if (at < 0) return '';
+      const start = Math.max(0, at - 14);
+      const end = Math.min(source.length, at + keyword.length + 18);
+      const slice = (start ? '…' : '') + source.slice(start, end) + (end < source.length ? '…' : '');
+      return marked(slice, keyword);
+    };
+    const paintNode = (node, keyword) => {
+      if (!node) return;
+      const marks = node.querySelectorAll ? node.querySelectorAll('mark.job-hit') : [];
+      marks.forEach((mark) => mark.replaceWith(document.createTextNode(mark.textContent || '')));
+      if (node.normalize) node.normalize();
+      const query = String(keyword || '').trim();
+      if (!query) return;
+      const q = query.toLowerCase();
+      const walker = document.createTreeWalker(node, NodeFilter.SHOW_TEXT);
+      const nodes = [];
+      while (walker.nextNode()) nodes.push(walker.currentNode);
+      nodes.forEach((textNode) => {
+        const source = textNode.nodeValue || '';
+        const lower = source.toLowerCase();
+        if (!lower.includes(q)) return;
+        const frag = document.createDocumentFragment();
+        let from = 0;
+        let at = lower.indexOf(q, from);
+        while (at >= 0) {
+          frag.append(source.slice(from, at));
+          const mark = document.createElement('mark');
+          mark.className = 'job-hit';
+          mark.textContent = source.slice(at, at + query.length);
+          frag.append(mark);
+          from = at + query.length;
+          at = lower.indexOf(q, from);
+        }
+        frag.append(source.slice(from));
+        textNode.parentNode.replaceChild(frag, textNode);
+      });
+    };
+    const highlightDetail = (keyword) => {
+      const dialog = document.querySelector('#job-dialog');
+      if (!dialog) return;
+      const headings = Array.from(dialog.querySelectorAll('h3, h4'));
+      const title = dialog.querySelector('h3');
+      const detailHead = headings.find((item) => (item.textContent || '').includes('岗位详情'));
+      const stop = headings.find((item) => (item.textContent || '').includes('采集信息'));
+      if (title) paintNode(title, keyword);
+      if (!detailHead) return;
+      let node = detailHead.nextElementSibling;
+      while (node && node !== stop) {
+        const next = node.nextElementSibling;
+        paintNode(node, keyword);
+        node = next;
+      }
+    };
+    window.__highlightJobHits = () => {
+      const keywordBox = document.querySelector('#job-keyword textarea, #job-keyword input');
+      highlightDetail(((keywordBox && keywordBox.value) || '').trim());
+    };
+    let scheduled = 0;
+    let appliedOverride = null;
+    const applyJobFilter = () => {
+      const table = document.querySelector('#job-table');
+      if (!table) return;
+      const keywordBox = document.querySelector('#job-keyword textarea, #job-keyword input');
+      const appliedBox = document.querySelector('#applied-only input[type="checkbox"]');
+      const keyword = ((keywordBox && keywordBox.value) || '').trim();
+      const q = keyword.toLowerCase();
+      const appliedOnly = appliedOverride === null ? !!(appliedBox && appliedBox.checked) : appliedOverride;
+      const rows = table.querySelectorAll('.job-sheet tbody tr');
+      let shown = 0;
+      rows.forEach((row) => {
+        const title = row.dataset.title || '';
+        const detail = row.dataset.detail || '';
+        const titleHit = !!q && title.toLowerCase().includes(q);
+        const detailHit = !!q && detail.toLowerCase().includes(q);
+        const visible = (!q || titleHit || detailHit) && (!appliedOnly || row.dataset.applied === '1');
+        row.classList.toggle('job-hidden', !visible);
+        if (visible) shown += 1;
+        const cell = row.querySelector('.job-title-cell');
+        if (!cell) return;
+        const stamp = keyword + '|' + (detailHit ? '1' : '0') + '|' + (titleHit ? '1' : '0');
+        if (cell.dataset.mark === stamp) return;
+        cell.dataset.mark = stamp;
+        const titleHtml = marked(title, titleHit ? keyword : '');
+        const extra = detailHit ? '<span class="job-hit-excerpt">' + excerpt(detail, keyword) + '</span>' : '';
+        cell.innerHTML = titleHtml + extra;
+      });
+      const label = table.querySelector('.job-sheet-label');
+      if (label) {
+        const next = (keyword || appliedOnly)
+          ? '当前职位（' + shown + ' / ' + rows.length + '）'
+          : '当前职位（' + rows.length + '）';
+        if (label.textContent !== next) label.textContent = next;
+      }
+      highlightDetail(keyword);
+    };
+    const scheduleFilter = () => {
+      if (scheduled) return;
+      scheduled = requestAnimationFrame(() => {
+        scheduled = 0;
+        applyJobFilter();
+        appliedOverride = null;
+      });
+    };
+    document.addEventListener('input', (event) => {
+      if (event.target.closest && event.target.closest('#job-keyword')) scheduleFilter();
+    });
+    document.addEventListener('pointerdown', (event) => {
+      if (!event.target.closest || !event.target.closest('#applied-only')) return;
+      const box = document.querySelector('#applied-only input[type="checkbox"]');
+      appliedOverride = !(box && box.checked);
+      scheduleFilter();
+    });
+    document.addEventListener('change', (event) => {
+      if (event.target.closest && event.target.closest('#applied-only')) scheduleFilter();
+    });
+    const watchTable = () => {
+      const host = document.querySelector('#job-table');
+      if (!host || host.dataset.filterWatch) return;
+      host.dataset.filterWatch = '1';
+      new MutationObserver(() => scheduleFilter()).observe(host, {childList: true});
+      scheduleFilter();
+    };
+    watchTable();
+    [300, 1000].forEach((ms) => setTimeout(() => { watchTable(); scheduleFilter(); }, ms));
   }
 }
 """,

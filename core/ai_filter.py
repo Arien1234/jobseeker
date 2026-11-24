@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import re
+import socket
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -12,7 +15,15 @@ import urllib.request
 from core.job_parser import clean_inline
 from core.logging_config import get_logger
 from core.models import RECOMMENDATIONS, recommendation_for_score
-from core.rules import evaluate_rules, listed_text, matching_terms, salary_bounds_k
+from core.rules import (
+    candidate_graduation_year,
+    evaluate_rules,
+    has_graduated,
+    listed_text,
+    matching_terms,
+    nature_label,
+    salary_bounds_k,
+)
 
 logger = get_logger("ai")
 OLLAMA_URL = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
@@ -26,18 +37,24 @@ SYSTEM_PROMPT = """你是求职匹配助手。必须先读完简历原文，再�
 总结要写出简历里哪一段和职位描述里的哪一项对上了。
 matched_skills 只能填写画像技能列表中的技能，并且该技能必须出现在职位名称或职位描述中。
 学历、工作经验、薪资、地点只要职位没有写明，就必须放入 unknown_fields，不得当成符合要求。
-只有下面几条才允许 hard_reject，summary 必须写成「必须拒绝：」加具体原因：城市不在已选城市、学历要求硕士或博士或研究生、经验年限达到排除线、薪资上限低于保底、岗位名称命中屏蔽、描述命中屏蔽词、公司规模写明了并且上限低于用户设定的人数。
-薪资没有上限。上限越高越好，不得因为薪资高、或薪资区间的下限偏低而降分或拒绝。只要上限不低于保底就可以接受。
+只有下面几条才允许 hard_reject，summary 必须写成「必须拒绝：」加具体原因：城市不在已选城市、学历要求硕士或博士或研究生、经验年限达到排除线、薪资上限低于保底、薪资下限高于已设的优先上限、岗位名称命中屏蔽、描述命中屏蔽词、公司规模写明了并且上限低于用户设定的人数、岗位届别和候选人毕业年份不一致、尚未毕业却去投没有提前实习转正的正式或社招。
+薪资先看保底：只有薪资上限低于保底才因太低而拒绝。低于优先薪资、但上限仍不低于保底的，要继续考虑，不得因为没到优先线就拒绝。prefer_salary_uncapped 为 false 时，薪资下限高于 salary_min_k 必须拒绝。prefer_salary_uncapped 为 true 时，薪资不设上限，越高越好，不得因为薪资高而拒绝。
 工作地点只看职位地点。客户公司地址、公司总部地址不能当成工作地点。发布方是人力资源或人才经纪公司时，只要职位地点和内容合适，不要因此拒绝。
 公司规模看页面写明的人数。客户公司人数优先，没有客户公司人数时看公司信息里的规模。达到用户设定的人数是加分。规模没写不要拒绝，也不要因此降到 80 分以下。
 HR 活跃状态看页面写明的标签。比用户设定的活跃下限更旧的，由本地规则硬拒绝，你不要再 hard_reject。当前在线或刚刚活跃可在总结里加一句加分。活跃没写不要因此拒绝。
-岗位类型（实习/正式/校招/社招）由本地硬规则处理，你不要因为类型再 hard_reject。
+每个岗位都要先判断属性，summary 开头写「岗位属性：实习、校招、正式、社招」中的对应项，可以同时有多项。
+实习：在校就能投，不需要毕业证。校招：面向应届的某一届，毕业前的秋招、春招就可以投，入职一般在拿到毕业证之后。岗位写明只招某一届时，必须和候选人的大学毕业年份一致，例如只招 26 届而候选人是 27 届，必须 hard_reject。写了「优先」或「也可」的届别不是硬性限制。
+正式和社招：要有毕业证才能入职。候选人尚未毕业时，只有岗位写明可以发 offer、提前实习并提供转正，才可以接受，并在 summary 里写明这一点；否则 hard_reject。候选人毕业年份看 education.graduation_year，再对照简历原文里的大学起止时间或届别。
 如果不是必须拒绝，summary 写清简历哪一段对上了职位描述的哪一项，以及可以接受的小瑕疵。
 只输出一个 JSON 对象，不要 Markdown。字段为 score、recommendation、hard_reject、hard_reject_reasons、matched_skills、missing_requirements、unknown_fields、summary。summary 用中文，不超过 180 字。"""
 
 
 class AIError(Exception):
     """The model could not be asked or its answer could not be used."""
+
+
+class AIInterrupted(Exception):
+    """The user stopped while the model was still working."""
 
 
 class AIJsonError(AIError):
@@ -173,7 +190,7 @@ def apply_policy(payload: dict, job: dict, profile: dict, extra_unknown: list[st
         if not summary.startswith("必须拒绝"):
             reasons = "；".join(result.get("hard_reject_reasons") or [])
             result["summary"] = clean_inline(f"必须拒绝：{reasons or summary}")[:180]
-        return result
+        return _stamp_nature(result, job)
     critical_unknown = [name for name in unknown if name in {"education", "experience", "salary", "location"}]
     score = int(result["score"])
     if critical_unknown and score >= 80:
@@ -193,10 +210,10 @@ def _favor_reachable_jobs(result: dict, job: dict, profile: dict) -> dict:
         return result
     unknown = set(result.get("unknown_fields") or [])
     if unknown & {"education", "experience", "salary", "location"}:
-        return result
+        return _stamp_nature(result, job)
     _, high = salary_bounds_k(job.get("salary") or "")
     if high is None:
-        return result
+        return _stamp_nature(result, job)
     prefer = float(profile.get("salary_min_k") or 0)
     floor_value = profile.get("salary_floor_k")
     floor = float(floor_value if floor_value is not None else prefer)
@@ -219,7 +236,24 @@ def _favor_reachable_jobs(result: dict, job: dict, profile: dict) -> dict:
         score = min(98, score + 2)
     result["score"] = score
     result["recommendation"] = recommendation_for_score(score)
+    return _stamp_nature(result, job)
+
+
+def _stamp_nature(result: dict, job: dict) -> dict:
+    prefix = f"岗位属性：{nature_label(job)}。"
+    summary = clean_inline(str(result.get("summary") or ""))
+    if not summary.startswith("岗位属性"):
+        summary = clean_inline(prefix + summary)
+    result["summary"] = summary[:180]
     return result
+
+
+def _profile_with_resume(profile: dict, resume_text: str) -> dict:
+    if not resume_text:
+        return profile
+    copied = dict(profile)
+    copied["resume_text"] = resume_text
+    return copied
 
 
 def local_rejection(job: dict, profile: dict) -> dict | None:
@@ -255,8 +289,17 @@ def build_user_message(job: dict, profile: dict, resume_text: str) -> str:
         "salary_min_k": profile.get("salary_min_k"),
         "salary_max_k": profile.get("salary_max_k"),
         "salary_type": profile.get("salary_type"),
-        "salary_policy": "salary_floor_k 是保底，只有薪资上限低于它才直接拒绝。薪资没有上限，越高越好。",
+        "salary_policy": (
+            "salary_floor_k 是保底，只有薪资上限低于它才因太低拒绝。低于 salary_min_k 仍要考虑。"
+            + (
+                "优先薪资不设上限，越高越好。"
+                if profile.get("prefer_salary_uncapped", True)
+                else "prefer_salary_uncapped 为 false：薪资下限高于 salary_min_k 必须拒绝。"
+            )
+        ),
         "education": profile.get("education") or {},
+        "graduation_year": candidate_graduation_year(profile),
+        "graduated": has_graduated(profile),
         "skills": profile.get("skills") or [],
         "projects": profile.get("projects") or [],
         "blocked_titles": listed_text(profile.get("blocked_titles")),
@@ -291,7 +334,74 @@ def build_user_message(job: dict, profile: dict, resume_text: str) -> str:
     return json.dumps(payload, ensure_ascii=False)
 
 
-def _post_chat(user_message: str, *, include_think: bool, num_predict: int, timeout: int) -> str:
+def _close_socket(box: dict) -> None:
+    sock = box.get("sock")
+    if sock is None:
+        return
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except Exception:
+        pass
+    try:
+        sock.close()
+    except Exception:
+        pass
+
+
+class _TrackedConnection(http.client.HTTPConnection):
+    def __init__(self, host, port=None, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, *, box=None, **kwargs):
+        super().__init__(host, port, timeout=timeout, **kwargs)
+        self._box = box
+
+    def connect(self):
+        super().connect()
+        if self._box is not None:
+            self._box["sock"] = self.sock
+            if self._box.get("cancel"):
+                _close_socket(self._box)
+
+
+class _CaptureHandler(urllib.request.HTTPHandler):
+    def __init__(self, box: dict):
+        super().__init__()
+        self._box = box
+
+    def http_open(self, req):
+        def factory(host, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, **kwargs):
+            return _TrackedConnection(host, timeout=timeout, box=self._box, **kwargs)
+
+        return self.do_open(factory, req)
+
+
+def _run_interruptible(worker, stop_event, timeout: int):
+    """Run worker(box) until it finishes, the deadline passes, or the user stops."""
+    box = {"cancel": False, "done": False}
+    def run() -> None:
+        try:
+            box["value"] = worker(box)
+        except Exception as exc:
+            box["error"] = exc
+        finally:
+            box["done"] = True
+
+    threading.Thread(target=run, name="ollama-call", daemon=True).start()
+    deadline = time.time() + timeout
+    while not box["done"]:
+        if stop_event is not None and stop_event.is_set():
+            box["cancel"] = True
+            _close_socket(box)
+            raise AIInterrupted("已停止，模型这次不等了")
+        if time.time() >= deadline:
+            box["cancel"] = True
+            _close_socket(box)
+            raise TimeoutError("Ollama 超时")
+        time.sleep(0.2)
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
+
+
+def _post_chat(user_message: str, *, include_think: bool, num_predict: int, timeout: int, stop_event=None) -> str:
     payload = {
         "model": MODEL,
         "stream": False,
@@ -311,8 +421,13 @@ def _post_chat(user_message: str, *, include_think: bool, num_predict: int, time
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        raw = response.read().decode("utf-8")
+
+    def worker(box: dict) -> str:
+        opener = urllib.request.build_opener(_CaptureHandler(box))
+        with opener.open(request, timeout=timeout) as response:
+            return response.read().decode("utf-8")
+
+    raw = _run_interruptible(worker, stop_event, timeout)
     try:
         data = json.loads(raw)
         content = data["message"]["content"]
@@ -324,21 +439,34 @@ def _post_chat(user_message: str, *, include_think: bool, num_predict: int, time
     return text
 
 
-def call_ollama(user_message: str, timeout: int = 180) -> str:
-    """Ask the local model. HTTP 500 and empty replies are retried; a longer reply is used after a short answer."""
+def _pause_for_retry(seconds: float, stop_event) -> None:
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        if stop_event is not None and stop_event.is_set():
+            raise AIInterrupted("已停止，模型这次不等了")
+        time.sleep(0.2)
+
+
+def call_ollama(user_message: str, timeout: int = 140, stop_event=None) -> str:
+    """Ask the local model. HTTP 500 and empty replies are retried; stop returns immediately."""
     last_error: Exception | None = None
     allow_think_flag = True
     for attempt in range(3):
+        if stop_event is not None and stop_event.is_set():
+            raise AIInterrupted("已停止，模型这次不等了")
         if attempt:
-            time.sleep(2 * attempt)
-        num_predict = 900 if attempt else 720
+            _pause_for_retry(2 * attempt, stop_event)
+        num_predict = 480
         try:
             return _post_chat(
                 user_message,
                 include_think=allow_think_flag,
                 num_predict=num_predict,
                 timeout=timeout,
+                stop_event=stop_event,
             )
+        except AIInterrupted:
+            raise
         except urllib.error.HTTPError as exc:
             last_error = exc
             if allow_think_flag and exc.code == 400:
@@ -349,7 +477,10 @@ def call_ollama(user_message: str, timeout: int = 180) -> str:
                         include_think=False,
                         num_predict=num_predict,
                         timeout=timeout,
+                        stop_event=stop_event,
                     )
+                except AIInterrupted:
+                    raise
                 except urllib.error.HTTPError as again:
                     exc = again
                     last_error = again
@@ -365,8 +496,13 @@ def call_ollama(user_message: str, timeout: int = 180) -> str:
                 continue
             logger.error("Ollama 调用失败: %s", exc)
             raise
+        except TimeoutError as exc:
+            logger.warning("Ollama 超时，先跳过这个岗位")
+            raise AIError("Ollama 调用失败: 超时") from exc
         except Exception as exc:
             last_error = exc
+            if stop_event is not None and stop_event.is_set():
+                raise AIInterrupted("已停止，模型这次不等了") from exc
             if attempt < 2:
                 logger.warning("Ollama 调用失败: %s，准备重试", type(exc).__name__)
                 continue
@@ -376,7 +512,8 @@ def call_ollama(user_message: str, timeout: int = 180) -> str:
     raise AIError("Ollama 调用失败") from last_error
 
 
-def analyze_job(job: dict, profile: dict, resume_text: str, api_key: str | None = None) -> dict:
+def analyze_job(job: dict, profile: dict, resume_text: str, api_key: str | None = None, stop_event=None) -> dict:
+    profile = _profile_with_resume(profile, resume_text)
     rejected = local_rejection(job, profile)
     if rejected is not None:
         return rejected
@@ -385,7 +522,7 @@ def analyze_job(job: dict, profile: dict, resume_text: str, api_key: str | None 
     content = ""
     payload = None
     for attempt in range(2):
-        content = call_ollama(message)
+        content = call_ollama(message, stop_event=stop_event)
         try:
             payload = parse_ai_payload(content)
             break
@@ -413,11 +550,13 @@ def analyze_pending(database, profile: dict, stop_event=None, on_log=None) -> di
             break
         label = f"{job.get('title') or ''} / {job.get('company') or ''}"
         try:
-            result = analyze_job(job, profile, resume_text)
+            result = analyze_job(job, profile, resume_text, stop_event=stop_event)
             database.save_analysis(job["id"], result)
             done += 1
             if on_log:
                 on_log(f"已分析 {label}：{result['score']} {result['recommendation']}")
+        except AIInterrupted:
+            break
         except AIError:
             failed += 1
             if on_log:

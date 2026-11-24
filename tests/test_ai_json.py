@@ -178,6 +178,47 @@ def test_hr_activity_and_job_type_are_hard_rules():
     assert full.hard_reject is False
 
 
+def test_pay_below_preferred_stays_and_pay_above_is_rejected_when_capped():
+    profile = dict(PROFILE)
+    profile["salary_floor_k"] = 4
+    profile["salary_min_k"] = 17
+    profile["prefer_salary_uncapped"] = False
+    assert evaluate_rules(_job(salary="8-12K"), profile).hard_reject is False
+    assert evaluate_rules(_job(salary="15-17K"), profile).hard_reject is False
+    assert evaluate_rules(_job(salary="18-25K"), profile).hard_reject
+    assert evaluate_rules(_job(salary="3-3.5K"), profile).hard_reject
+    open_ended = dict(profile)
+    open_ended["prefer_salary_uncapped"] = True
+    assert evaluate_rules(_job(salary="18-25K"), open_ended).hard_reject is False
+
+
+def test_cohort_and_graduation_rules():
+    student = dict(PROFILE)
+    student["job_types"] = ["实习", "校招", "正式", "社招"]
+    student["education"] = {"graduation_year": 2027, "status": "在读", "degree": "本科"}
+    student["resume_text"] = "东莞城市学院 人工智能本科 2023.09-2027.06"
+    campus = evaluate_rules(_job(title="Python开发", description="招聘2027届，可实习"), student)
+    assert campus.hard_reject is False
+    wrong_class = evaluate_rules(_job(title="26届校招Python", description="只招2026届毕业生"), student)
+    assert wrong_class.hard_reject
+    assert "2026届" in "；".join(wrong_class.reasons)
+    preferred_only = evaluate_rules(_job(description="校招，26届优先，27届也可投"), student)
+    assert preferred_only.hard_reject is False
+    formal = evaluate_rules(_job(title="Python开发工程师", description="全职正式，需毕业证"), student)
+    assert formal.hard_reject
+    assert "毕业证" in "；".join(formal.reasons)
+    convertible = evaluate_rules(
+        _job(title="Python开发工程师", description="全职正式，可提前实习并提供转正"),
+        student,
+    )
+    assert convertible.hard_reject is False
+    graduate = dict(student)
+    graduate["education"] = {"graduation_year": 2024, "status": "已毕业", "degree": "本科"}
+    graduate["resume_text"] = "2024届本科毕业"
+    hired = evaluate_rules(_job(title="Python开发工程师", description="社招全职"), graduate)
+    assert hired.hard_reject is False
+
+
 def test_slightly_lower_pay_can_still_be_recommended():
     flexible = dict(PROFILE)
     flexible["salary_floor_k"] = 7
@@ -198,3 +239,22 @@ def test_think_block_is_ignored():
         ' "matched_skills": [], "risks": [], "hard_reject": false}'
     )
     assert payload["score"] == 88
+
+
+def test_stop_does_not_wait_for_a_hung_model():
+    import threading
+    import time
+
+    from core.ai_filter import AIInterrupted, _run_interruptible
+
+    stop = threading.Event()
+
+    def hang(box):
+        time.sleep(30)
+        return "late"
+
+    stop.set()
+    started = time.perf_counter()
+    with pytest.raises(AIInterrupted):
+        _run_interruptible(hang, stop, 30)
+    assert time.perf_counter() - started < 1.5

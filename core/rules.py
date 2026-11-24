@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from datetime import date
 
 
 @dataclass
@@ -97,6 +98,96 @@ def hr_activity_level(text: str) -> int | None:
     return None
 
 
+def nature_label(job: dict) -> str:
+    found = detect_job_types(job)
+    ordered = [name for name in ("实习", "校招", "正式", "社招") if name in found]
+    return "、".join(ordered) or "未识别"
+
+
+def parse_resume_graduation_year(text: str) -> int | None:
+    """University graduation year written on the resume, such as 2027届 or 2023-2027."""
+    if not text:
+        return None
+    cohorts = [int(year) for year in re.findall(r"(20\d{2})\s*届", text) if 2020 <= int(year) <= 2040]
+    if cohorts:
+        return max(cohorts)
+    best: tuple[int, int] | None = None
+    for match in re.finditer(
+        r"(20\d{2})\s*[.\-/年]\s*(?:\d{1,2})?\s*[-~～至到—]\s*(20\d{2})",
+        text,
+    ):
+        end = int(match.group(2))
+        if not 2020 <= end <= 2040:
+            continue
+        window = text[max(0, match.start() - 40) : match.end() + 40]
+        score = end + (100 if any(token in window for token in ("本科", "大学", "学院", "在读")) else 0)
+        if best is None or score > best[0]:
+            best = (score, end)
+    if best is not None:
+        return best[1]
+    graduated = re.search(r"(20\d{2})\s*年?\s*(?:0?6|0?7)?\s*月?\s*毕业", text)
+    if graduated and 2020 <= int(graduated.group(1)) <= 2040:
+        return int(graduated.group(1))
+    return None
+
+
+def candidate_graduation_year(profile: dict) -> int | None:
+    parsed = parse_resume_graduation_year(str(profile.get("resume_text") or ""))
+    if parsed:
+        return parsed
+    raw = (profile.get("education") or {}).get("graduation_year")
+    try:
+        year = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return year if 2020 <= year <= 2040 else None
+
+
+def has_graduated(profile: dict, year: int | None = None) -> bool | None:
+    """False while the candidate is still in university. None when the year is unknown."""
+    status = str((profile.get("education") or {}).get("status") or "")
+    if "在读" in status or "未毕业" in status:
+        return False
+    if year is None:
+        year = candidate_graduation_year(profile)
+    if year is None:
+        return None
+    today = date.today()
+    if year > today.year:
+        return False
+    if year < today.year:
+        return True
+    return today.month >= 7
+
+
+def required_cohorts(text: str) -> set[int] | None:
+    """Graduating classes the posting explicitly recruits. Preferences such as 优先 are ignored."""
+    found: set[int] = set()
+    for match in re.finditer(r"(?<!\d)(20\d{2}|\d{2})\s*届", text or ""):
+        year = int(match.group(1))
+        if year < 100:
+            year += 2000
+        if not 2020 <= year <= 2040:
+            continue
+        before = text[max(0, match.start() - 6) : match.start()]
+        after = text[match.end() : match.end() + 6]
+        if any(flag in before or flag in after for flag in ("优先", "亦可", "也可", "欢迎")):
+            continue
+        if "不限" in before:
+            continue
+        found.add(year)
+    return found or None
+
+
+def offers_pre_graduation_conversion(text: str) -> bool:
+    """A formal role can be considered before graduation only with an early internship and conversion."""
+    if any(phrase in text for phrase in ("实习转正", "转正实习")):
+        return True
+    early = any(phrase in text for phrase in ("提前实习", "提前到岗", "offer后实习", "拿到offer后"))
+    conversion = "转正" in text
+    return early and conversion
+
+
 def detect_job_types(job: dict) -> set[str]:
     blob = "\n".join(
         [
@@ -159,7 +250,7 @@ def evaluate_rules(job: dict, profile: dict) -> RuleResult:
             reasons.append(f"必须拒绝：经验要求是{experience}，达到排除线（{threshold}年及以上）")
 
     salary = (job.get("salary") or "").strip()
-    _, high = salary_bounds_k(salary)
+    low, high = salary_bounds_k(salary)
     if not salary or high is None:
         unknown.append("salary")
     elif rules.get("reject_salary_max_below_min", True):
@@ -167,7 +258,13 @@ def evaluate_rules(job: dict, profile: dict) -> RuleResult:
         if floor is None:
             floor = profile.get("salary_min_k") or 0
         if high < float(floor):
-            reasons.append(f"必须拒绝：薪资上限是{salary}，低于保底{int(float(floor))}K。薪资没有上限，只有上限低于保底才拒绝")
+            reasons.append(f"必须拒绝：薪资上限是{salary}，低于保底{int(float(floor))}K")
+        elif profile.get("prefer_salary_uncapped", True) is False:
+            prefer = float(profile.get("salary_min_k") or 0)
+            if prefer > 0 and low is not None and low > prefer:
+                reasons.append(
+                    f"必须拒绝：薪资下限是{salary}，高于优先薪资{int(prefer)}K。低于或等于优先薪资的会继续考虑"
+                )
 
     title = job.get("title") or ""
     description = job.get("description") or ""
@@ -187,12 +284,34 @@ def evaluate_rules(job: dict, profile: dict) -> RuleResult:
     job_types = detect_job_types(job)
     if allowed_types and not (job_types & allowed_types):
         reasons.append(
-            "必须拒绝：岗位类型是"
-            + "、".join(sorted(job_types))
+            "必须拒绝：岗位属性是"
+            + nature_label(job)
             + "，不在已选类型（"
-            + "、".join(sorted(allowed_types))
+            + "、".join(name for name in ("实习", "校招", "正式", "社招") if name in allowed_types)
             + "）"
         )
+
+    blob = "\n".join([title, experience, description])
+    graduation_year = candidate_graduation_year(profile)
+    campus_selected = bool(allowed_types & {"实习", "校招"})
+    campus_job = bool(job_types & {"实习", "校招"})
+    if graduation_year and (campus_selected or campus_job):
+        cohorts = required_cohorts(blob)
+        if cohorts and graduation_year not in cohorts:
+            shown = "、".join(f"{year}届" for year in sorted(cohorts))
+            reasons.append(
+                f"必须拒绝：岗位明确招聘{shown}，简历是{graduation_year}届，届别不一致"
+            )
+    graduated = has_graduated(profile, graduation_year)
+    if graduated is False and not campus_job and job_types & {"正式", "社招"}:
+        if not offers_pre_graduation_conversion(blob):
+            year_text = f"{graduation_year}届" if graduation_year else "尚未毕业"
+            reasons.append(
+                "必须拒绝：岗位属性是"
+                + nature_label(job)
+                + f"，需要毕业证。简历{year_text}还在读。"
+                + "没有毕业证时，只有岗位写明发 offer、提前实习并提供转正才投"
+            )
 
     activity_max = (profile.get("hr_activity_max") or "本月活跃").strip()
     if activity_max in HR_ACTIVITY_LEVELS:
